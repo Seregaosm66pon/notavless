@@ -5,12 +5,11 @@ Utilities for extracting and parsing VLESS configs.
 from __future__ import annotations
 
 import asyncio
+import http.client
 import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 from uuid import UUID
 
 VLESS_URL_RE = re.compile(r"vless://[^\s<>'\"`]+", re.IGNORECASE)
@@ -108,23 +107,34 @@ def parse_vless_source(text: str) -> dict[str, Any]:
 
 
 def _download_text_sync(url: str, timeout: int = 20) -> str:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; VlessRepoUpdater/1.0)",
-            "Accept": "text/plain,*/*",
-        },
-    )
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise VlessSourceError("Unsupported URL.")
+
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    connection_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    connection = connection_cls(parsed.netloc, timeout=timeout)
     try:
-        with urlopen(request, timeout=timeout) as response:
-            charset = response.headers.get_content_charset() or "utf-8"
-            return response.read().decode(charset, errors="replace")
-    except HTTPError as exc:
-        raise VlessSourceError(f"HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise VlessSourceError(str(exc.reason)) from exc
+        connection.request(
+            "GET",
+            path,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; VlessRepoUpdater/1.0)",
+                "Accept": "text/plain,*/*",
+            },
+        )
+        response = connection.getresponse()
+        if response.status >= 400:
+            raise VlessSourceError(f"HTTP {response.status}")
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.read().decode(charset, errors="replace")
     except OSError as exc:
         raise VlessSourceError(str(exc)) from exc
+    finally:
+        connection.close()
 
 
 async def download_vless_source(url: str, timeout: int = 20) -> str:

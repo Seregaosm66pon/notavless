@@ -36,4 +36,9 @@ GITHUB_VLESS_RAW_URLS = [
 ]
 SOURCES_FILE = os.getenv("SOURCES_FILE", str(REPO_ROOT / "sources.txt"))
 VPN_SUBSCRIPTION_OUTPUT = os.getenv("VPN_SUBSCRIPTION_OUTPUT", "vless_subscription.txt").strip()
+VPN_SUBSCRIPTION_OUTPUT_LTE = os.getenv("VPN_SUBSCRIPTION_OUTPUT_LTE", "vless_lte.txt").strip()
+VPN_SUBSCRIPTION_OUTPUT_WIFI = os.getenv("VPN_SUBSCRIPTION_OUTPUT_WIFI", "vless_wifi.txt").strip()
 VPN_GIT_COMMIT_MESSAGE = os.getenv("VPN_GIT_COMMIT_MESSAGE", "Update VLESS subscription").strip()
+URL_TEST_TARGET = os.getenv("URL_TEST_TARGET", "http://www.gstatic.com/generate_204").strip()
+TG_NOTIFY_TOKEN = os.getenv("TG_NOTIFY_TOKEN", "").strip()
+TG_NOTIFY_CHANNEL = os.getenv("TG_NOTIFY_CHANNEL", "").strip()
