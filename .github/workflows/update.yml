@@ -1,0 +1,42 @@
+name: Auto Update Nota Vless Subscriptions (Every 2 Hours)
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'  # Runs every 2 hours
+  workflow_dispatch:        # Allows manual trigger in GitHub Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  update-vless:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fetch, validate and update subscriptions
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN || '8740400260:AAGeOM6eO27VfziUjmYGYeXgCVmQAF6eN-Y' }}
+          TG_NOTIFY_TOKEN: ${{ secrets.TG_NOTIFY_TOKEN || '8740400260:AAGeOM6eO27VfziUjmYGYeXgCVmQAF6eN-Y' }}
+          TG_NOTIFY_CHANNEL: ${{ secrets.TG_NOTIFY_CHANNEL || '@notavless' }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          VPN_SOURCE_CHANNELS: ${{ secrets.VPN_SOURCE_CHANNELS }}
+        run: |
+          python refresh_vless_repo.py
