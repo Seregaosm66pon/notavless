@@ -4,5 +4,5 @@
 #announce: Nota Vless - тело в дело!
 #subscription-userinfo: upload=0; download=0; total=0; expire=0
 
-#generated-at: 2026-11-19 20:35:02
-hysteria2://7e68e32f-8015-4f37-9082-70e8b0b58043@13.229.50.232:443?insecure=1&sni=www.bing.com#%F0%9F%87%B8%F0%9F%87%AC%20%E6%96%B0%E5%8A%A0%E5%9D%A1%20%7C%20SGP%20%232
+#generated-at: 2026-11-19 22:33:20
+hysteria2://3f63c86c-ac4a-4900-85cf-4fedf93c2ca5@91.240.86.70:22443?sni=hy.quattro-tech.ru&insecure=0&allowInsecure=0#%F0%9F%8C%8D%20%D0%9E%D0%B1%D1%85%D0%BE%D0%B4%20%D0%B1%D1%81
