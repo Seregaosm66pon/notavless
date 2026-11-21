@@ -17,13 +17,125 @@ from typing import Sequence
 from protocols import ParsedConfig
 
 # Common country flag mapping
-FLAG_MAP = {
+# Common country mapping: (code, flag, russian_name, search_keywords)
+COUNTRY_RU_NAMES: dict[str, str] = {
+    "ru": "Россия",
+    "de": "Германия",
+    "nl": "Нидерланды",
+    "fi": "Финляндия",
+    "us": "США",
+    "fr": "Франция",
+    "se": "Швеция",
+    "gb": "Великобритания",
+    "uk": "Великобритания",
+    "pl": "Польша",
+    "tr": "Турция",
+    "kz": "Казахстан",
+    "ua": "Украина",
+    "ch": "Швейцария",
+    "at": "Австрия",
+    "es": "Испания",
+    "it": "Италия",
+    "sg": "Сингапур",
+    "jp": "Япония",
+    "hk": "Гонконг",
+    "ca": "Канада",
+    "cz": "Чехия",
+    "ro": "Румыния",
+    "bg": "Болгария",
+    "md": "Молдова",
+    "ee": "Эстония",
+    "lv": "Латвия",
+    "lt": "Литва",
+    "no": "Норвегия",
+    "dk": "Дания",
+    "am": "Армения",
+    "ge": "Грузия",
+    "by": "Беларусь",
+    "al": "Албания",
+    "rs": "Сербия",
+    "cy": "Кипр",
+    "ae": "ОАЭ",
+    "in": "Индия",
+    "kr": "Южная Корея",
+    "br": "Бразилия",
+    "il": "Израиль",
+    "gr": "Греция",
+    "hu": "Венгрия",
+    "ie": "Ирландия",
+    "is": "Исландия",
+    "pt": "Португалия",
+    "lu": "Люксембург",
+    "be": "Бельгия",
+    "sk": "Словакия",
+    "si": "Словения",
+    "hr": "Хорватия",
+    "hn": "Гондурас",
+    "ir": "Иран",
+    "xx": "Сервер",
+}
+
+FLAG_MAP: dict[str, str] = {
     "ru": "🇷🇺", "de": "🇩🇪", "nl": "🇳🇱", "fi": "🇫🇮", "us": "🇺🇸",
     "fr": "🇫🇷", "se": "🇸🇪", "gb": "🇬🇧", "uk": "🇬🇧", "pl": "🇵🇱",
-    "tr": "🇹🇷", "kz": "🇰🇿", "ua": "🇺🇦", "ch": "🇨🇭", "at": "🇦🇹",
+    "tr": "🇹🇷", "kz": "🇰🇿", "ua": "Украина", "ch": "🇨🇭", "at": "🇦🇹",
     "es": "🇪🇸", "it": "🇮🇹", "sg": "🇸🇬", "jp": "🇯🇵", "hk": "🇭🇰",
     "ca": "🇨🇦", "cz": "🇨🇿", "ro": "🇷🇴", "bg": "🇧🇬", "md": "🇲🇩",
     "ee": "🇪🇪", "lv": "🇱🇻", "lt": "🇱🇹", "no": "🇳🇴", "dk": "🇩🇰",
+    "am": "🇦🇲", "ge": "🇬🇪", "by": "🇧🇾", "al": "🇦🇱", "rs": "🇷🇸",
+    "cy": "🇨🇾", "ae": "🇦🇪", "in": "🇮🇳", "kr": "🇰🇷", "br": "🇧🇷",
+    "il": "🇮🇱", "gr": "🇬🇷", "hu": "🇭🇺", "ie": "🇮🇪", "is": "🇮🇸",
+    "pt": "🇵🇹", "lu": "🇱🇺", "be": "🇧🇪", "sk": "🇸🇰", "si": "🇸🇮",
+    "hr": "🇭🇷", "hn": "🇭🇳", "ir": "🇮🇷",
+}
+
+COUNTRY_KEYWORDS: dict[str, list[str]] = {
+    "de": ["germany", "deutschland", "frankfurt", "berlin", "falkenstein", "nuremberg", "munich", "duesseldorf", "de"],
+    "nl": ["netherlands", "holland", "amsterdam", "rotterdam", "nl"],
+    "fi": ["finland", "helsinki", "fi"],
+    "ru": ["russia", "russian", "moscow", "spb", "surgut", "piter", "ru"],
+    "us": ["usa", "united states", "america", "virginia", "california", "new york", "miami", "chicago", "los angeles", "dallas", "seattle", "us"],
+    "fr": ["france", "paris", "marseille", "strasbourg", "gravelines", "fr"],
+    "se": ["sweden", "stockholm", "kista", "se"],
+    "gb": ["united kingdom", "britain", "england", "london", "manchester", "uk", "gb"],
+    "pl": ["poland", "warsaw", "warszawa", "krakow", "pl"],
+    "tr": ["turkey", "turkiye", "istanbul", "bursa", "ankara", "izmir", "tr"],
+    "kz": ["kazakhstan", "almaty", "astana", "kz"],
+    "ua": ["ukraine", "kyiv", "kiev", "lviv", "odessa", "ua"],
+    "ch": ["switzerland", "zurich", "geneva", "ch"],
+    "at": ["austria", "vienna", "at"],
+    "es": ["spain", "madrid", "barcelona", "valencia", "es"],
+    "it": ["italy", "milan", "rome", "it"],
+    "sg": ["singapore", "sg"],
+    "jp": ["japan", "tokyo", "osaka", "jp"],
+    "hk": ["hong kong", "hongkong", "hk"],
+    "ca": ["canada", "toronto", "montreal", "vancouver", "ca"],
+    "cz": ["czech", "prague", "cz"],
+    "ro": ["romania", "bucharest", "ro"],
+    "bg": ["bulgaria", "sofia", "bg"],
+    "md": ["moldova", "chisinau", "md"],
+    "ee": ["estonia", "tallinn", "ee"],
+    "lv": ["latvia", "riga", "lv"],
+    "lt": ["lithuania", "vilnius", "lt"],
+    "no": ["norway", "oslo", "no"],
+    "dk": ["denmark", "copenhagen", "dk"],
+    "am": ["armenia", "yerevan", "am"],
+    "ge": ["georgia", "tbilisi", "ge"],
+    "by": ["belarus", "minsk", "by"],
+    "al": ["albania", "tirana", "al"],
+    "rs": ["serbia", "belgrade", "rs"],
+    "ae": ["uae", "dubai", "abu dhabi", "ae"],
+    "in": ["india", "mumbai", "delhi", "in"],
+    "kr": ["korea", "seoul", "kr"],
+    "br": ["brazil", "sao paulo", "br"],
+    "il": ["israel", "tel aviv", "il"],
+    "gr": ["greece", "athens", "gr"],
+    "hu": ["hungary", "budapest", "hu"],
+    "ie": ["ireland", "dublin", "ie"],
+    "is": ["iceland", "reykjavik", "is"],
+    "pt": ["portugal", "lisbon", "pt"],
+    "lu": ["luxembourg", "lu"],
+    "be": ["belgium", "brussels", "be"],
 }
 
 FLAG_EMOJI_RE = re.compile(r"[\U0001F1E6-\U0001F1FF]{2}")
@@ -37,6 +149,7 @@ class NodeCheckResult:
     tls_ok: bool
     country_code: str
     country_flag: str
+    country_name: str
     quality_tier: str  # "⚡ ULTRA", "🟢 FAST", "🟡 NORMAL", "🔴 SLOW", "💀 DEAD"
     error_msg: str = ""
 
@@ -48,45 +161,73 @@ class NodeCheckResult:
         return f"{flag} DEAD ({self.error_msg or 'timeout'})"
 
 
-def detect_country_flag(remark: str) -> tuple[str, str]:
-    """Extract emoji flag and 2-letter country code from remark text."""
+def detect_country_info(remark: str, host: str = "", sni: str = "") -> tuple[str, str, str]:
+    """
+    Extract (code, flag, russian_name) using emoji flags, keywords, subdomains, and host cues.
+    """
     # 1. Direct emoji flag in remark
     match = FLAG_EMOJI_RE.search(remark)
     if match:
         flag = match.group(0)
-        # Convert regional indicator symbols to ascii country code
-        code = "".join(chr(ord(c) - 0x1F1E6 + ord('A')) for c in flag).lower()
-        return code, flag
+        code = "".join(chr(ord(c) - 0x1F1E6 + ord('a')) for c in flag).lower()
+        ru_name = COUNTRY_RU_NAMES.get(code, code.upper())
+        return code, flag, ru_name
 
-    # 2. Text heuristics in remark
-    lower = remark.lower()
-    for code, flag in FLAG_MAP.items():
-        patterns = [
-            f"[{code}]", f"({code})", f"_{code}_", f"/{code}", f"| {code}",
-            f"{code} |", f"#{code}"
-        ]
-        if any(p in lower for p in patterns):
-            return code, flag
+    # 2. Search keywords across remark, host, and sni
+    combined = f"{remark} {host} {sni}".lower()
+    for code, keywords in COUNTRY_KEYWORDS.items():
+        for kw in keywords:
+            if len(kw) <= 2:
+                patterns = [
+                    f"[{kw}]", f"({kw})", f"_{kw}_", f"/{kw}", f"| {kw}",
+                    f"{kw} |", f"#{kw}", f"-{kw}-", f".{kw}.", f" {kw} ",
+                ]
+                if any(p in combined for p in patterns):
+                    flag = FLAG_MAP.get(code, "🌐")
+                    ru_name = COUNTRY_RU_NAMES.get(code, code.upper())
+                    return code, flag, ru_name
+            else:
+                if kw in combined:
+                    flag = FLAG_MAP.get(code, "🌐")
+                    ru_name = COUNTRY_RU_NAMES.get(code, code.upper())
+                    return code, flag, ru_name
 
-    # 3. Keyword matches
-    keywords = {
-        "germany": ("de", "🇩🇪"), "frankfurt": ("de", "🇩🇪"),
-        "netherlands": ("nl", "🇳🇱"), "amsterdam": ("nl", "🇳🇱"),
-        "finland": ("fi", "🇫🇮"), "helsinki": ("fi", "🇫🇮"),
-        "russia": ("ru", "🇷🇺"), "moscow": ("ru", "🇷🇺"),
-        "france": ("fr", "🇫🇷"), "paris": ("fr", "🇫🇷"),
-        "sweden": ("se", "🇸🇪"), "stockholm": ("se", "🇸🇪"),
-        "poland": ("pl", "🇵🇱"), "warsaw": ("pl", "🇵🇱"),
-        "turkey": ("tr", "🇹🇷"), "istanbul": ("tr", "🇹🇷"),
-        "kazakhstan": ("kz", "🇰🇿"), "almaty": ("kz", "🇰🇿"),
-        "usa": ("us", "🇺🇸"), "united states": ("us", "🇺🇸"),
-        "london": ("gb", "🇬🇧"), "england": ("gb", "🇬🇧"),
-    }
-    for kw, (c, f) in keywords.items():
-        if kw in lower:
-            return c, f
+    # 3. Check domain cues (subdomains like de2. or TLDs like .ru)
+    for domain in (sni, host):
+        if not domain or domain.replace(".", "").isdigit():
+            continue
+        parts = domain.lower().split(".")
+        if len(parts) >= 2:
+            tld = parts[-1]
+            if tld in COUNTRY_RU_NAMES and tld not in ("com", "org", "net", "xyz", "site", "online", "top", "io", "me", "co", "cc", "cd", "pw", "ws", "app", "dev"):
+                flag = FLAG_MAP.get(tld, "🌐")
+                return tld, flag, COUNTRY_RU_NAMES[tld]
+            sub = parts[0]
+            sub_code = re.sub(r"[0-9_\-].*$", "", sub)
+            if sub_code in COUNTRY_RU_NAMES and len(sub_code) == 2:
+                flag = FLAG_MAP.get(sub_code, "🌐")
+                return sub_code, flag, COUNTRY_RU_NAMES[sub_code]
 
-    return "xx", "🌐"
+    return "xx", "🌐", "Сервер"
+
+
+def detect_country_flag(remark: str) -> tuple[str, str]:
+    """Backward compatibility helper returning (code, flag)."""
+    code, flag, _ = detect_country_info(remark)
+    return code, flag
+
+
+def classify_russian_tier(latency_ms: float) -> str:
+    """Classify latency into Russian display tier requested by user."""
+    if latency_ms <= 0:
+        return "Ультра"
+    if latency_ms < 85:
+        return "Ультра"
+    if latency_ms < 180:
+        return "Быстрый"
+    if latency_ms < 350:
+        return "Стандарт"
+    return "Базовый"
 
 
 def classify_tier(latency_ms: float, alive: bool) -> str:
@@ -105,7 +246,7 @@ async def check_node_advanced(cfg: ParsedConfig, timeout: float = 2.5) -> NodeCh
     """
     Perform deep connection latency check and TLS verification for a proxy configuration.
     """
-    code, flag = detect_country_flag(cfg.remark)
+    code, flag, ru_name = detect_country_info(cfg.remark, cfg.host, cfg.sni)
 
     # Hysteria 2 UDP probe
     if cfg.protocol == "hysteria2":
@@ -126,6 +267,7 @@ async def check_node_advanced(cfg: ParsedConfig, timeout: float = 2.5) -> NodeCh
                 tls_ok=alive,
                 country_code=code,
                 country_flag=flag,
+                country_name=ru_name,
                 quality_tier=tier,
             )
         except Exception as exc:
@@ -136,6 +278,7 @@ async def check_node_advanced(cfg: ParsedConfig, timeout: float = 2.5) -> NodeCh
                 tls_ok=False,
                 country_code=code,
                 country_flag=flag,
+                country_name=ru_name,
                 quality_tier="💀 DEAD",
                 error_msg=str(exc)[:40],
             )
@@ -188,6 +331,7 @@ async def check_node_advanced(cfg: ParsedConfig, timeout: float = 2.5) -> NodeCh
             tls_ok=tls_success,
             country_code=code,
             country_flag=flag,
+            country_name=ru_name,
             quality_tier=tier,
         )
     except asyncio.TimeoutError:
@@ -198,6 +342,7 @@ async def check_node_advanced(cfg: ParsedConfig, timeout: float = 2.5) -> NodeCh
             tls_ok=False,
             country_code=code,
             country_flag=flag,
+            country_name=ru_name,
             quality_tier="💀 DEAD",
             error_msg="Timeout",
         )
@@ -216,6 +361,7 @@ async def check_node_advanced(cfg: ParsedConfig, timeout: float = 2.5) -> NodeCh
             tls_ok=False,
             country_code=code,
             country_flag=flag,
+            country_name=ru_name,
             quality_tier="💀 DEAD",
             error_msg=reason,
         )

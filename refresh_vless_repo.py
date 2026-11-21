@@ -13,6 +13,7 @@ import logging
 import socket
 import ssl
 import subprocess
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -26,6 +27,8 @@ from config import (
     GITHUB_VLESS_RAW_URL,
     GITHUB_VLESS_RAW_URLS,
     HYSTERIA2_SUBSCRIPTION_OUTPUT,
+    MEGA_FASTEST_OUTPUT,
+    MEGA_FASTEST_URL,
     MEGA_SUBSCRIPTION_OUTPUT,
     MEGA_SUBSCRIPTION_URL,
     REPO_ROOT,
@@ -50,6 +53,7 @@ from contributors import (
     get_custom_nodes,
     read_sources_with_contributors,
 )
+from checker import classify_russian_tier, detect_country_info
 from protocols import (
     ParsedConfig,
     ProxySourceError,
@@ -159,8 +163,33 @@ def dedupe_configs(configs: list[ParsedConfig]) -> list[ParsedConfig]:
     return deduped
 
 
-def normalize_urls(configs: list[ParsedConfig]) -> list[str]:
-    return [cfg.raw_url for cfg in configs]
+def normalize_urls(
+    configs: list[ParsedConfig],
+    latencies: dict[tuple[str, str, int], float] | None = None,
+    default_tier: str = "Ультра",
+) -> list[str]:
+    if latencies is None:
+        latencies = {}
+
+    country_counters: dict[str, int] = {}
+    normalized: list[str] = []
+
+    for cfg in configs:
+        key = (cfg.protocol, cfg.host, cfg.port)
+        lat = latencies.get(key, 0.0)
+        tier = classify_russian_tier(lat) if lat > 0 else default_tier
+
+        code, flag, country_name = detect_country_info(cfg.remark, cfg.host, cfg.sni)
+        country_counters[country_name] = country_counters.get(country_name, 0) + 1
+        idx = country_counters[country_name]
+
+        # Branded template: [Ультра] Германия #1 NOTAVLESS
+        new_name = f"[{tier}] {country_name} #{idx} NOTAVLESS"
+        base_url = cfg.raw_url.split("#", 1)[0]
+        quoted_name = urllib.parse.quote(new_name)
+        normalized.append(f"{base_url}#{quoted_name}")
+
+    return normalized
 
 
 def is_lte_config(cfg: ParsedConfig) -> bool:
@@ -485,28 +514,35 @@ async def check_url_test(target_url: str, timeout: float = 5.0) -> bool:
         return False
 
 
-async def filter_reachable_configs(configs: list[ParsedConfig]) -> tuple[list[ParsedConfig], int]:
-    ok: list[ParsedConfig] = []
+async def filter_reachable_configs(configs: list[ParsedConfig]) -> tuple[list[ParsedConfig], int, dict[tuple[str, str, int], float], list[float]]:
+    ok: list[tuple[ParsedConfig, float]] = []
     failed = 0
     sem = asyncio.Semaphore(CHECK_CONCURRENCY)
-    host_cache: dict[tuple[str, str, int], bool] = {}
+    host_cache: dict[tuple[str, str, int], tuple[bool, float]] = {}
 
     async def check(cfg: ParsedConfig) -> None:
         nonlocal failed
         key = (cfg.protocol, cfg.host, cfg.port)
         async with sem:
             if key in host_cache:
-                alive = host_cache[key]
+                alive, lat = host_cache[key]
             else:
+                t0 = time.perf_counter()
                 alive = await check_node(cfg, timeout=CHECK_TIMEOUT)
-                host_cache[key] = alive
+                lat = round((time.perf_counter() - t0) * 1000.0, 1) if alive else 9999.0
+                host_cache[key] = (alive, lat)
         if alive:
-            ok.append(cfg)
+            ok.append((cfg, lat))
         else:
             failed += 1
 
     await asyncio.gather(*(check(cfg) for cfg in configs))
-    return ok, failed
+    # Sort by lowest latency
+    ok.sort(key=lambda item: item[1])
+    sorted_configs = [cfg for cfg, _ in ok]
+    latencies_map = {(cfg.protocol, cfg.host, cfg.port): lat for cfg, lat in ok}
+    latencies_list = [lat for _, lat in ok]
+    return sorted_configs, failed, latencies_map, latencies_list
 
 
 async def run_update_pipeline() -> dict:
@@ -517,7 +553,7 @@ async def run_update_pipeline() -> dict:
     if not url_test_ok:
         logger.warning("URL test target is not reachable: %s", URL_TEST_TARGET)
 
-    reachable, connect_failed = await filter_reachable_configs(deduped)
+    reachable, connect_failed, latencies_map, latencies = await filter_reachable_configs(deduped)
 
     # Segregate by protocol
     vless_configs = [c for c in reachable if c.protocol == "vless"]
@@ -528,17 +564,20 @@ async def run_update_pipeline() -> dict:
     lte_configs, wifi_configs = split_lte_wifi(reachable)
 
     # Mega subscription: Universal (All WiFi + LTE, VLESS + Trojan + Hy2)
-    mega_urls = normalize_urls(reachable)
-    vless_all_urls = normalize_urls(vless_configs)
-    lte_urls = normalize_urls(lte_configs)
-    wifi_urls = normalize_urls(wifi_configs)
-    trojan_urls = normalize_urls(trojan_configs)
-    hy2_urls = normalize_urls(hy2_configs)
+    mega_urls = normalize_urls(reachable, latencies_map)
+    fastest_configs = reachable[:100]
+    fastest_urls = normalize_urls(fastest_configs, latencies_map)
+    vless_all_urls = normalize_urls(vless_configs, latencies_map)
+    lte_urls = normalize_urls(lte_configs, latencies_map)
+    wifi_urls = normalize_urls(wifi_configs, latencies_map)
+    trojan_urls = normalize_urls(trojan_configs, latencies_map)
+    hy2_urls = normalize_urls(hy2_configs, latencies_map)
 
     # Standard outputs
     outputs: list[tuple[Path, str, list[str]]] = [
         # Mega / Universal subscription
         (REPO_ROOT / MEGA_SUBSCRIPTION_OUTPUT, "Nota Vless Universal Mega", mega_urls),
+        (REPO_ROOT / MEGA_FASTEST_OUTPUT, "Nota Vless Fastest Top 100", fastest_urls),
         # VLESS collections
         (REPO_ROOT / VPN_SUBSCRIPTION_OUTPUT, "Nota Vless", vless_all_urls),
         (REPO_ROOT / VPN_SUBSCRIPTION_OUTPUT_LTE, "Nota Vless LTE", lte_urls),
@@ -561,6 +600,7 @@ async def run_update_pipeline() -> dict:
     if GENERATE_BASE64:
         base64_outputs = (
             (REPO_ROOT / "mega_sub_base64.txt", mega_urls),
+            (REPO_ROOT / "mega_sub_fastest_base64.txt", fastest_urls),
             (REPO_ROOT / "vlessall_base64.txt", vless_all_urls),
             (REPO_ROOT / "vless_lte_base64.txt", lte_urls),
             (REPO_ROOT / "vless_wifi_base64.txt", wifi_urls),
@@ -575,14 +615,19 @@ async def run_update_pipeline() -> dict:
     git_status = push_if_changed(changed_paths)
     contributors_summary = get_contributors_summary(limit=4)
 
+    avg_ping = round(sum(latencies) / len(latencies), 1) if latencies else 0.0
+    min_ping = round(min(latencies), 1) if latencies else 0.0
+
     # Telegram notification matching exact requested format
     msg = (
         "New update:3\n"
         f"> servers amount:{len(mega_urls)}\n"
+        f"> best ping:{min_ping}ms | avg ping:{avg_ping}ms\n"
         f"> lte amount:{len(lte_urls)}\n"
         f"> wifi amount:{len(wifi_urls)}\n"
         f"> changed:{str(changed).lower()}\n\n"
-        f"> Universal config: {MEGA_SUBSCRIPTION_URL}"
+        f"> Universal config: {MEGA_SUBSCRIPTION_URL}\n"
+        f"> Fastest (Top 100): {MEGA_FASTEST_URL}"
     )
 
     logger.info(
@@ -612,6 +657,8 @@ async def run_update_pipeline() -> dict:
         "hy2": len(hy2_urls),
         "lte": len(lte_urls),
         "wifi": len(wifi_urls),
+        "avg_ping": avg_ping,
+        "min_ping": min_ping,
         "changed": changed,
         "git_status": git_status,
     }

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from config import (
+    MEGA_FASTEST_URL,
     MEGA_SUBSCRIPTION_OUTPUT,
     MEGA_SUBSCRIPTION_URL,
     REPO_ROOT,
@@ -62,9 +63,12 @@ def cmd_update(args: argparse.Namespace) -> None:
         print(f"    - Hysteria 2 nodes:   {stats['hy2']}")
         print(f"    - LTE nodes:          {stats['lte']}")
         print(f"    - WiFi nodes:         {stats['wifi']}")
+        if "avg_ping" in stats:
+            print(f"    - Avg Ping:           {stats['avg_ping']} ms (Best: {stats.get('min_ping', 0)} ms)")
         print(f"    - Files changed:      {stats['changed']}")
         print(f"    - Git status:         {stats['git_status']}")
-        print(f"\n[>] Universal config: {MEGA_SUBSCRIPTION_URL}\n")
+        print(f"\n[>] Universal config: {MEGA_SUBSCRIPTION_URL}")
+        print(f"[>] Fastest Top 100:  {MEGA_FASTEST_URL}\n")
     except Exception as exc:
         print(f"[-] Update failed: {exc}", file=sys.stderr)
         sys.exit(1)

@@ -57,6 +57,11 @@ MEGA_SUBSCRIPTION_URL = os.getenv(
     "MEGA_SUBSCRIPTION_URL",
     "https://raw.githubusercontent.com/Seregaosm66pon/notavless/main/mega_sub.txt",
 ).strip()
+MEGA_FASTEST_OUTPUT = os.getenv("MEGA_FASTEST_OUTPUT", "mega_sub_fastest.txt").strip()
+MEGA_FASTEST_URL = os.getenv(
+    "MEGA_FASTEST_URL",
+    "https://raw.githubusercontent.com/Seregaosm66pon/notavless/main/mega_sub_fastest.txt",
+).strip()
 
 # 2. VLESS files (All / Legacy / LTE / WiFi)
 VPN_SUBSCRIPTION_OUTPUT = os.getenv("VPN_SUBSCRIPTION_OUTPUT", "vlessall.txt").strip()
