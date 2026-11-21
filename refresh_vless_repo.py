@@ -467,10 +467,50 @@ async def check_udp_reachability(host: str, port: int, timeout: float = 2.5) -> 
         return False
 
 
-async def check_node(cfg: ParsedConfig, timeout: float = 2.5) -> bool:
+async def check_node(cfg: ParsedConfig, timeout: float = 2.5) -> tuple[bool, float]:
+    # 1. Hysteria 2: cannot be probed via raw UDP without sing-box; give high latency so it stays at bottom
     if cfg.protocol == "hysteria2":
-        return await check_udp_reachability(cfg.host, cfg.port, timeout=timeout)
-    return await check_tcp_port(cfg.host, cfg.port, timeout=timeout)
+        return True, 999.0
+
+    # 2. VLESS & Trojan: real TCP reachability check
+    t0 = time.perf_counter()
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(cfg.host, cfg.port),
+            timeout=timeout,
+        )
+        rtt = (time.perf_counter() - t0) * 1000.0
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+        # 3. If Reality or TLS with SNI, verify real TLS handshake
+        if cfg.security in ("tls", "reality") and cfg.sni:
+            try:
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                t1 = time.perf_counter()
+                r2, w2 = await asyncio.wait_for(
+                    asyncio.open_connection(cfg.host, cfg.port, ssl=ssl_ctx, server_hostname=cfg.sni),
+                    timeout=max(1.5, timeout * 0.7),
+                )
+                tls_rtt = (time.perf_counter() - t1) * 1000.0
+                w2.close()
+                try:
+                    await w2.wait_closed()
+                except Exception:
+                    pass
+                return True, round(tls_rtt, 1)
+            except Exception:
+                # TLS handshake failed (blocked SNI or dead backend) -> filter out
+                return False, 9999.0
+
+        return True, round(rtt, 1)
+    except Exception:
+        return False, 9999.0
 
 
 async def check_url_test(target_url: str, timeout: float = 5.0) -> bool:
@@ -527,9 +567,7 @@ async def filter_reachable_configs(configs: list[ParsedConfig]) -> tuple[list[Pa
             if key in host_cache:
                 alive, lat = host_cache[key]
             else:
-                t0 = time.perf_counter()
-                alive = await check_node(cfg, timeout=CHECK_TIMEOUT)
-                lat = round((time.perf_counter() - t0) * 1000.0, 1) if alive else 9999.0
+                alive, lat = await check_node(cfg, timeout=CHECK_TIMEOUT)
                 host_cache[key] = (alive, lat)
         if alive:
             ok.append((cfg, lat))
@@ -541,7 +579,7 @@ async def filter_reachable_configs(configs: list[ParsedConfig]) -> tuple[list[Pa
     ok.sort(key=lambda item: item[1])
     sorted_configs = [cfg for cfg, _ in ok]
     latencies_map = {(cfg.protocol, cfg.host, cfg.port): lat for cfg, lat in ok}
-    latencies_list = [lat for _, lat in ok]
+    latencies_list = [lat for _, lat in ok if lat < 900.0]
     return sorted_configs, failed, latencies_map, latencies_list
 
 
@@ -555,18 +593,35 @@ async def run_update_pipeline() -> dict:
 
     reachable, connect_failed, latencies_map, latencies = await filter_reachable_configs(deduped)
 
-    # Segregate by protocol
-    vless_configs = [c for c in reachable if c.protocol == "vless"]
-    trojan_configs = [c for c in reachable if c.protocol == "trojan"]
-    hy2_configs = [c for c in reachable if c.protocol == "hysteria2"]
+    # Segregate by protocol and sort by lowest latency
+    vless_configs = sorted(
+        [c for c in reachable if c.protocol == "vless"],
+        key=lambda c: latencies_map.get((c.protocol, c.host, c.port), 9999.0),
+    )
+    trojan_configs = sorted(
+        [c for c in reachable if c.protocol == "trojan"],
+        key=lambda c: latencies_map.get((c.protocol, c.host, c.port), 9999.0),
+    )
+    hy2_configs = sorted(
+        [c for c in reachable if c.protocol == "hysteria2"],
+        key=lambda c: latencies_map.get((c.protocol, c.host, c.port), 9999.0),
+    )
 
-    # Segregate by network type (LTE vs WiFi)
-    lte_configs, wifi_configs = split_lte_wifi(reachable)
+    # Mega subscription: VLESS (verified fastest) FIRST -> Trojan -> Hysteria 2 at the bottom!
+    mega_ordered = vless_configs + trojan_configs + hy2_configs
+    mega_urls = normalize_urls(mega_ordered, latencies_map)
 
-    # Mega subscription: Universal (All WiFi + LTE, VLESS + Trojan + Hy2)
-    mega_urls = normalize_urls(reachable, latencies_map)
-    fastest_configs = reachable[:100]
+    # Fastest Top 100: ONLY verified working VLESS and Trojan nodes! NO unverified Hysteria!
+    fastest_pool = [
+        c for c in (vless_configs + trojan_configs)
+        if latencies_map.get((c.protocol, c.host, c.port), 9999.0) < 500.0
+    ]
+    fastest_configs = fastest_pool[:100] if fastest_pool else (vless_configs[:100])
     fastest_urls = normalize_urls(fastest_configs, latencies_map)
+
+    # Segregate by network type (LTE vs WiFi) using ordered configs
+    lte_configs, wifi_configs = split_lte_wifi(mega_ordered)
+
     vless_all_urls = normalize_urls(vless_configs, latencies_map)
     lte_urls = normalize_urls(lte_configs, latencies_map)
     wifi_urls = normalize_urls(wifi_configs, latencies_map)

@@ -248,7 +248,7 @@ async def check_node_advanced(cfg: ParsedConfig, timeout: float = 2.5) -> NodeCh
     """
     code, flag, ru_name = detect_country_info(cfg.remark, cfg.host, cfg.sni)
 
-    # Hysteria 2 UDP probe
+    # Hysteria 2 probe (UDP often blocked in Russia, give conservative latency)
     if cfg.protocol == "hysteria2":
         t0 = time.perf_counter()
         try:
@@ -257,18 +257,19 @@ async def check_node_advanced(cfg: ParsedConfig, timeout: float = 2.5) -> NodeCh
                 loop.getaddrinfo(cfg.host, cfg.port, proto=socket.IPPROTO_UDP),
                 timeout=timeout,
             )
-            rtt = (time.perf_counter() - t0) * 1000.0
             alive = bool(res)
+            # Give hysteria 500ms baseline latency so it doesn't take priority over verified VLESS
+            rtt = 500.0
             tier = classify_tier(rtt, alive)
             return NodeCheckResult(
                 config=cfg,
                 alive=alive,
-                latency_ms=round(rtt, 1),
+                latency_ms=rtt,
                 tls_ok=alive,
                 country_code=code,
                 country_flag=flag,
                 country_name=ru_name,
-                quality_tier=tier,
+                quality_tier="🟡 NORMAL",
             )
         except Exception as exc:
             return NodeCheckResult(
@@ -391,8 +392,8 @@ async def benchmark_nodes(
     if tasks:
         await asyncio.gather(*tasks)
 
-    # Sort: Alive first, then by lowest latency ms
-    results.sort(key=lambda r: (not r.alive, r.latency_ms))
+    # Sort: Alive first, VLESS/Trojan before Hysteria, then by lowest latency ms
+    results.sort(key=lambda r: (not r.alive, r.config.protocol == "hysteria2", r.latency_ms))
     return results
 
 
