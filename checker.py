@@ -284,6 +284,20 @@ async def check_node_advanced(cfg: ParsedConfig, timeout: float = 2.5) -> NodeCh
                 error_msg=str(exc)[:40],
             )
 
+    # Reject unencrypted VLESS / Trojan (security == 'none' or insecure HTTP ports 80, 8080, 8880, 2086, 2082)
+    if cfg.security not in ("reality", "tls") or cfg.port in (80, 8080, 8880, 2086, 2082):
+        return NodeCheckResult(
+            config=cfg,
+            alive=False,
+            latency_ms=9999.0,
+            tls_ok=False,
+            country_code=code,
+            country_flag=flag,
+            country_name=ru_name,
+            quality_tier="💀 DEAD",
+            error_msg="Insecure port/proto",
+        )
+
     # TCP / TLS probe for VLESS & Trojan
     t0 = time.perf_counter()
     tls_success = False

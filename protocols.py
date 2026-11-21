@@ -111,6 +111,8 @@ def parse_vless_url(raw_url: str, added_by: str = "") -> ParsedConfig | None:
             return None
         if not (1 <= port <= 65535):
             return None
+        if any(bad in host for bad in ("&", "=", "?", "/", " ", "\\", "#", ";")):
+            return None
 
         try:
             UUID(user_id)
@@ -156,6 +158,8 @@ def parse_trojan_url(raw_url: str, added_by: str = "") -> ParsedConfig | None:
             return None
         if not (1 <= port <= 65535):
             return None
+        if any(bad in host for bad in ("&", "=", "?", "/", " ", "\\", "#", ";")):
+            return None
 
         params = parse_qs(parsed.query, keep_blank_values=True)
         security = _first_value(params, "security") or "tls"
@@ -198,6 +202,8 @@ def parse_hysteria2_url(raw_url: str, added_by: str = "") -> ParsedConfig | None
         if not host or not port:
             return None
         if not (1 <= port <= 65535):
+            return None
+        if any(bad in host for bad in ("&", "=", "?", "/", " ", "\\", "#", ";")):
             return None
 
         params = parse_qs(parsed.query, keep_blank_values=True)

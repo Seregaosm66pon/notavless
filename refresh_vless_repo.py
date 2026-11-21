@@ -472,7 +472,14 @@ async def check_node(cfg: ParsedConfig, timeout: float = 2.5) -> tuple[bool, flo
     if cfg.protocol == "hysteria2":
         return True, 999.0
 
-    # 2. VLESS & Trojan: real TCP reachability check
+    # 2. Reject unencrypted VLESS / Trojan (security == 'none' or insecure HTTP ports 80, 8080, 8880, 2086, 2082)
+    # These are blocked by Russian TSPU/RKN and fail URL test in Throne
+    if cfg.security not in ("reality", "tls"):
+        return False, 9999.0
+    if cfg.port in (80, 8080, 8880, 2086, 2082):
+        return False, 9999.0
+
+    # 3. VLESS & Trojan: real TCP reachability check
     t0 = time.perf_counter()
     try:
         reader, writer = await asyncio.wait_for(
@@ -486,8 +493,8 @@ async def check_node(cfg: ParsedConfig, timeout: float = 2.5) -> tuple[bool, flo
         except Exception:
             pass
 
-        # 3. If Reality or TLS with SNI, verify real TLS handshake
-        if cfg.security in ("tls", "reality") and cfg.sni:
+        # 4. For standard TLS (not Reality), verify TLS certificate handshake
+        if cfg.security == "tls" and cfg.sni:
             try:
                 ssl_ctx = ssl.create_default_context()
                 ssl_ctx.check_hostname = False
@@ -505,9 +512,10 @@ async def check_node(cfg: ParsedConfig, timeout: float = 2.5) -> tuple[bool, flo
                     pass
                 return True, round(tls_rtt, 1)
             except Exception:
-                # TLS handshake failed (blocked SNI or dead backend) -> filter out
+                # Standard TLS handshake failed -> filter out
                 return False, 9999.0
 
+        # 5. For Reality, TCP connect confirms the Reality listener is reachable
         return True, round(rtt, 1)
     except Exception:
         return False, 9999.0
@@ -593,11 +601,16 @@ async def run_update_pipeline() -> dict:
 
     reachable, connect_failed, latencies_map, latencies = await filter_reachable_configs(deduped)
 
-    # Segregate by protocol and sort by lowest latency
-    vless_configs = sorted(
-        [c for c in reachable if c.protocol == "vless"],
-        key=lambda c: latencies_map.get((c.protocol, c.host, c.port), 9999.0),
-    )
+    # Segregate by protocol and sort by lowest latency with Reality:443 preference
+    def vless_pref(c: ParsedConfig) -> tuple[int, float]:
+        lat = latencies_map.get((c.protocol, c.host, c.port), 9999.0)
+        # Tier 0: Reality on 443 (gold standard in RU)
+        # Tier 1: Reality on high ports
+        # Tier 2: Standard TLS
+        tier = 0 if (c.security == "reality" and c.port == 443) else (1 if c.security == "reality" else 2)
+        return (tier, lat)
+
+    vless_configs = sorted([c for c in reachable if c.protocol == "vless"], key=vless_pref)
     trojan_configs = sorted(
         [c for c in reachable if c.protocol == "trojan"],
         key=lambda c: latencies_map.get((c.protocol, c.host, c.port), 9999.0),
