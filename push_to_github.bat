@@ -1,12 +1,13 @@
 @echo off
+chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
-title Nota Vless - Push to GitHub
+title Nota Vless - GitHub Push
 
 echo ===================================================
-echo     Nota Vless - Загрузка подписок на GitHub
+echo     Nota Vless - GitHub Sync & Upload
 echo ===================================================
-echo [*] Проверяем Git и статус репозитория...
+echo [*] Checking git repository...
 
 git status >nul 2>nul
 if %ERRORLEVEL% neq 0 (
@@ -14,13 +15,12 @@ if %ERRORLEVEL% neq 0 (
     git remote add origin https://github.com/Seregaosm66pon/notavless.git >nul 2>nul
 )
 
-echo [*] Добавляем все файлы и подписки...
+echo [*] Staging all files...
 git add -A
-git commit -m "Update subscriptions (mega_sub, vless, trojan, hy2)" >nul 2>nul
+git commit -m "Update subscriptions: mega_sub, vless, trojan, hy2" >nul 2>nul
 
-echo [*] Отправляем файлы в репозиторий https://github.com/Seregaosm66pon/notavless ...
-echo [*] ВНИМАНИЕ: Если сейчас появится всплывающее окно входа GitHub в браузере:
-echo [*] Нажмите зеленую кнопку "Authorize" (вход выполняется один раз).
+echo [*] Pushing to https://github.com/Seregaosm66pon/notavless ...
+echo [*] If a browser window opens, click Authorize to complete sign-in.
 echo.
 
 git push -u origin main
@@ -28,19 +28,18 @@ git push -u origin main
 echo.
 if %ERRORLEVEL% equ 0 (
     echo ===================================================
-    echo [+] УСПЕШНО! Все файлы залиты на GitHub!
-    echo [+] Ссылка https://raw.githubusercontent.com/Seregaosm66pon/notavless/main/mega_sub.txt теперь работает (код 200)!
+    echo [+] SUCCESS! All files uploaded to GitHub!
+    echo [+] Link: https://raw.githubusercontent.com/Seregaosm66pon/notavless/main/mega_sub.txt
     echo ===================================================
 ) else (
     echo ===================================================
-    echo [-] Отправка не удалась. Возможные причины:
-    echo     1. Требуется войти в GitHub в браузере
-    echo     2. Либо в ветке main на GitHub есть конфликты. Попробуем git push --force:
+    echo [-] Push failed or was cancelled.
+    echo [*] If you need to force push:
     echo ===================================================
-    set /p RETRY="Попробовать форсированный push (y/n)? "
-    if /i "%RETRY%"=="y" (
-        git push -u origin main --force
-    )
+    choice /m "Try git push --force?"
+    if errorlevel 2 goto end
+    if errorlevel 1 git push -u origin main --force
 )
 
+:end
 pause
