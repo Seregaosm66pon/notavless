@@ -1,11 +1,10 @@
 @echo off
-chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 title Nota Vless - GitHub Push
 
 echo ===================================================
-echo     Nota Vless - GitHub Sync & Upload
+echo     Nota Vless - GitHub Sync and Upload
 echo ===================================================
 echo [*] Checking git repository...
 
@@ -20,7 +19,7 @@ git add -A
 git commit -m "Update subscriptions: mega_sub, vless, trojan, hy2" >nul 2>nul
 
 echo [*] Pushing to https://github.com/Seregaosm66pon/notavless ...
-echo [*] If a browser window opens, click Authorize to complete sign-in.
+echo [*] Opening browser sign-in if needed...
 echo.
 
 git push -u origin main
@@ -33,8 +32,8 @@ if %ERRORLEVEL% equ 0 (
     echo ===================================================
 ) else (
     echo ===================================================
-    echo [-] Push failed or was cancelled.
-    echo [*] If you need to force push:
+    echo [-] Push failed or was rejected.
+    echo [*] If the remote has different commits, try force push:
     echo ===================================================
     choice /m "Try git push --force?"
     if errorlevel 2 goto end
@@ -42,4 +41,6 @@ if %ERRORLEVEL% equ 0 (
 )
 
 :end
-pause
+echo.
+echo Press any key to exit.
+pause >nul
