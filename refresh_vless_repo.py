@@ -602,13 +602,24 @@ async def run_update_pipeline() -> dict:
     reachable, connect_failed, latencies_map, latencies = await filter_reachable_configs(deduped)
 
     # Segregate by protocol and sort by lowest latency with Reality:443 preference
-    def vless_pref(c: ParsedConfig) -> tuple[int, float]:
+    def vless_pref(c: ParsedConfig) -> tuple[int, int, float]:
         lat = latencies_map.get((c.protocol, c.host, c.port), 9999.0)
+        _, _, country_name = detect_country_info(c.remark, c.host, c.sni)
+        # Known country preferred over generic "Сервер"
+        country_tier = 1 if country_name == "Сервер" else 0
         # Tier 0: Reality on 443 (gold standard in RU)
         # Tier 1: Reality on high ports
-        # Tier 2: Standard TLS
-        tier = 0 if (c.security == "reality" and c.port == 443) else (1 if c.security == "reality" else 2)
-        return (tier, lat)
+        # Tier 2: Standard TLS on 443
+        # Tier 3: Standard TLS on other ports
+        if c.security == "reality" and c.port == 443:
+            sec_tier = 0
+        elif c.security == "reality":
+            sec_tier = 1
+        elif c.security == "tls" and c.port == 443:
+            sec_tier = 2
+        else:
+            sec_tier = 3
+        return (country_tier, sec_tier, lat)
 
     vless_configs = sorted([c for c in reachable if c.protocol == "vless"], key=vless_pref)
     trojan_configs = sorted(
@@ -624,11 +635,17 @@ async def run_update_pipeline() -> dict:
     mega_ordered = vless_configs + trojan_configs + hy2_configs
     mega_urls = normalize_urls(mega_ordered, latencies_map)
 
-    # Fastest Top 100: ONLY verified working VLESS and Trojan nodes! NO unverified Hysteria!
+    # Fastest Top 100: ONLY verified working VLESS and Trojan nodes with identified countries (<250ms)!
     fastest_pool = [
         c for c in (vless_configs + trojan_configs)
-        if latencies_map.get((c.protocol, c.host, c.port), 9999.0) < 500.0
+        if latencies_map.get((c.protocol, c.host, c.port), 9999.0) < 250.0
+        and detect_country_info(c.remark, c.host, c.sni)[2] != "Сервер"
     ]
+    if len(fastest_pool) < 50:
+        fastest_pool = [
+            c for c in (vless_configs + trojan_configs)
+            if latencies_map.get((c.protocol, c.host, c.port), 9999.0) < 400.0
+        ]
     fastest_configs = fastest_pool[:100] if fastest_pool else (vless_configs[:100])
     fastest_urls = normalize_urls(fastest_configs, latencies_map)
 

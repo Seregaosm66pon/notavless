@@ -1,12 +1,12 @@
-# Nota Vless Sources (VLESS, Trojan, Hysteria 2 for Russia bypass)
+# Nota Vless Sources (High-Quality VLESS Reality & Trojan for Russia TSPU/RKN bypass)
 # Format: <url> # added_by: @username
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt # added_by: @igareck
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt # added_by: @igareck
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-all.txt # added_by: @igareck
+https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-SNI-RU-all.txt # added_by: @igareck
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt # added_by: @igareck
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt # added_by: @igareck
 https://raw.githubusercontent.com/aviamastersgh/vpn-free-russia/main/ru_configs.txt # added_by: @aviamasters
 https://raw.githubusercontent.com/aviamastersgh/vpn-free-russia/main/verified_configs.txt # added_by: @aviamasters
-https://raw.githubusercontent.com/aviamastersgh/vpn-free-russia/main/all_configs.txt # added_by: @aviamasters
 https://raw.githubusercontent.com/zieng2/wl/main/vless_lite.txt # added_by: @zieng2
 https://raw.githubusercontent.com/prominbro/sub/refs/heads/main/212.txt # added_by: @prominbro
