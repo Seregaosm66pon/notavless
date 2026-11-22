@@ -1,7 +1,8 @@
 @echo off
+chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
-title Nota Vless - Tester and Latency Benchmark
+title Nota Vless - Ultimate High-Speed Tester & DPI Benchmark
 
 if not exist ".venv\Scripts\activate.bat" (
     echo [ERROR] Virtual environment not found. Please run run.bat first!
@@ -10,6 +11,6 @@ if not exist ".venv\Scripts\activate.bat" (
 )
 
 call .venv\Scripts\activate.bat
-python cli.py bench
+python tester.py
 pause
 endlocal

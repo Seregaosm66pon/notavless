@@ -35,6 +35,11 @@ from contributors import (
 from checker import benchmark_nodes, build_health_report, check_node_advanced
 from protocols import parse_any_proxy_url
 from refresh_vless_repo import check_node, check_tcp_port, run_update_pipeline
+from tester import (
+    execute_benchmark_interactive,
+    main_interactive_menu,
+    run_single_node_diagnostic,
+)
 
 
 def print_banner() -> None:
@@ -256,134 +261,21 @@ def cmd_test(args: argparse.Namespace) -> None:
         print("[-] Цель не указана.")
         return
 
-    print(f"\n[*] Диагностика узла: {target[:70]}...")
-
-    parsed = parse_any_proxy_url(target)
-    if parsed:
-        print(f"    Протокол:       {parsed.protocol.upper()} ({parsed.security or 'none'})")
-        print(f"    Хост:           {parsed.host}:{parsed.port}")
-        if parsed.sni:
-            print(f"    SNI:            {parsed.sni}")
-        if parsed.remark:
-            print(f"    Имя:            {parsed.remark}")
-
-        print("    [~] Измерение точного RTT пинга и проверка TLS/DPI...")
-        res = asyncio.run(check_node_advanced(parsed, timeout=3.5))
-        if res.alive:
-            print(f"\n[+] СТАТУС:       🟢 РАБОТАЕТ! (ONLINE)")
-            print(f"    Локация:      {res.country_flag} {res.country_code.upper()}")
-            print(f"    Пинг (RTT):   {res.latency_ms:.1f} ms [{res.quality_tier}]")
-            print(f"    TLS / DPI:    {'✅ ОБХОДИТ ТСПУ / TLS OK' if res.tls_ok else '⚠️ TLS с ошибкой'}")
-        else:
-            print(f"\n[-] СТАТУС:       💀 НЕ РАБОТАЕТ (OFFLINE)")
-            print(f"    Причина:      {res.error_msg or 'Timeout / Host unreachable'}")
-        print()
-        return
-
-    if ":" in target and not target.startswith("http"):
-        parts = target.split(":")
-        host = parts[0].strip()
-        try:
-            port = int(parts[1].strip())
-            t0 = time.perf_counter()
-            alive = asyncio.run(check_tcp_port(host, port, timeout=3.5))
-            rtt = (time.perf_counter() - t0) * 1000.0
-            if alive:
-                print(f"[+] TCP порт {host}:{port} ОТКРЫТ! Пинг: {rtt:.1f} ms")
-            else:
-                print(f"[-] TCP порт {host}:{port} ЗАКРЫТ или недоступен.")
-            return
-        except ValueError:
-            pass
-
-    print("[-] Неверный формат. Введите ссылку vless://, trojan://, hy2:// или ip:port.")
+    asyncio.run(run_single_node_diagnostic(target))
 
 
 def cmd_benchmark(args: argparse.Namespace) -> None:
-    print("\n=======================================================")
-    print("      БЕНЧМАРК И АУДИТ СКОРОСТИ СЕРВЕРОВ NOTA VLESS    ")
-    print("=======================================================")
-    print(" [1] Экспресс-аудит (топ-50 серверов)")
-    print(" [2] Глубокий бенчмарк (все серверы из mega_sub.txt)")
-    print(" [3] Проверить один конкретный узел")
-    print(" [0] Назад")
-    try:
-        sub = input("Выберите режим [0-3]: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        return
-
-    limit = 50
-    if sub == "1":
-        limit = 50
-    elif sub == "2":
-        limit = 0  # all
-    elif sub == "3":
-        cmd_test(argparse.Namespace(target=""))
-        return
-    elif sub in ("0", "q", "exit"):
-        return
-
-    sub_file = REPO_ROOT / MEGA_SUBSCRIPTION_OUTPUT
-    if not sub_file.exists():
-        print(f"[-] Файл {MEGA_SUBSCRIPTION_OUTPUT} не найден. Сначала запустите Update.")
-        return
-
-    lines = sub_file.read_text(encoding="utf-8").splitlines()
-    configs = []
-    for line in lines:
-        p = parse_any_proxy_url(line)
-        if p:
-            configs.append(p)
-            if limit and len(configs) >= limit:
-                break
-
-    if not configs:
-        print("[-] Нет валидных серверов для теста.")
-        return
-
-    print(f"\n[*] Запуск тестирования {len(configs)} серверов...")
-    print("[*] Замер точного RTT пинга, TLS-рукопожатия и геопозиции...\n")
-
-    def progress(done: int, total: int, last_res) -> None:
-        pct = int(done / total * 100)
-        bar_len = 25
-        filled = int(bar_len * done / total)
-        bar = "█" * filled + "░" * (bar_len - filled)
-        tag = last_res.display_tag if last_res else ""
-        print(f"\r  [{bar}] {pct:>3}% ({done}/{total}) | {tag:<28}", end="", flush=True)
-
-    results = asyncio.run(benchmark_nodes(configs, concurrency=32, progress_callback=progress))
-    print("\n")
-
-    rep = build_health_report(results)
-
-    print("=======================================================")
-    print(f"  📊 ОБЩЕЕ ЗДОРОВЬЕ ПУЛА:  {rep['success_rate_pct']}% ЖИВЫХ ({rep['alive']}/{rep['total']})")
-    print(f"  ⚡ СРЕДНИЙ ПИНГ:         {rep['avg_ping_ms']} ms")
-    print(f"  ⏱  ДИАПАЗОН:            {rep['min_ping_ms']} ms ... {rep['max_ping_ms']} ms")
-    print("-------------------------------------------------------")
-    print(f"  ⚡ Ультра (<85ms):      {rep['tiers']['ultra']} серверов")
-    print(f"  🟢 Быстрые (85-180ms):  {rep['tiers']['fast']} серверов")
-    print(f"  🟡 Обычные (180-350ms): {rep['tiers']['normal']} серверов")
-    print(f"  🔴 Медленные (>350ms):  {rep['tiers']['slow']} серверов")
-    print(f"  💀 Мертвые / Таймаут:   {rep['dead']} серверов")
-    print("-------------------------------------------------------")
-    print("  🌍 ТОП ЛОКАЦИЙ С ЛУЧШИМ ПИНГОМ:")
-    for c in rep["top_countries"]:
-        print(f"     {c['name']:<16} : {c['count']:>3} шт. (ср. {c['avg_latency']} ms)")
-    print("-------------------------------------------------------")
-    print("  🏆 ТОП-10 САМЫХ БЫСТРЫХ СЕРВЕРОВ:")
-    for rank, n in enumerate(rep["fastest_nodes"], 1):
-        rem = f"({n['remark']})" if n["remark"] else ""
-        print(f"  {rank:>2}. {n['flag']} {n['protocol'].upper():<7} {n['host']:<18}:{n['port']:<5} {n['latency_ms']:>5.1f} ms [{n['tier']}] {rem}")
-    print("=======================================================\n")
-
-    alive_res = [r for r in results if r.alive]
-    if alive_res:
-        fastest_file = REPO_ROOT / "mega_sub_fastest.txt"
-        top_lines = [r.config.raw_url for r in alive_res[:100]]
-        fastest_file.write_text("\n".join(top_lines) + "\n", encoding="utf-8")
-        print(f"[+] Топ-100 самых быстрых серверов сохранены в {fastest_file.name}!")
+    limit = getattr(args, "limit", 0)
+    all_flag = getattr(args, "all", False)
+    deep_flag = getattr(args, "deep", False)
+    non_interactive = getattr(args, "non_interactive", False)
+    is_inter = not non_interactive and sys.stdin.isatty()
+    if all_flag:
+        asyncio.run(execute_benchmark_interactive(limit=0, deep_http=deep_flag, interactive=is_inter))
+    elif limit > 0:
+        asyncio.run(execute_benchmark_interactive(limit=limit, deep_http=deep_flag, interactive=is_inter))
+    else:
+        main_interactive_menu()
 
 
 def save_env_var(key: str, value: str) -> None:
@@ -649,12 +541,21 @@ def main() -> None:
     post_parser.add_argument("--channel", default="", help="Target Telegram channel (e.g. @mychannel)")
 
     # test
-    test_parser = subparsers.add_parser("test", help="Test connectivity of a node or host:port")
+    test_parser = subparsers.add_parser("test", help="Deep DPI & latency diagnostics of a node or host:port")
     test_parser.add_argument("target", nargs="?", default="", help="Proxy URL or host:port")
 
     # benchmark / audit
-    subparsers.add_parser("bench", help="Run latency benchmark across nodes")
-    subparsers.add_parser("audit", help="Run latency benchmark and health audit")
+    bench_parser = subparsers.add_parser("bench", help="Run interactive latency & DPI benchmark across nodes")
+    bench_parser.add_argument("--limit", type=int, default=0, help="Max nodes to test in benchmark")
+    bench_parser.add_argument("--all", action="store_true", help="Test all nodes from mega_sub.txt")
+    bench_parser.add_argument("--deep", "--http-probe", action="store_true", help="Run Deep HTTP delay probe on top nodes")
+    bench_parser.add_argument("--non-interactive", "-y", action="store_true", help="Run non-interactively without menu prompts")
+
+    audit_parser = subparsers.add_parser("audit", help="Run interactive latency & DPI benchmark across nodes")
+    audit_parser.add_argument("--limit", type=int, default=0, help="Max nodes to test in benchmark")
+    audit_parser.add_argument("--all", action="store_true", help="Test all nodes from mega_sub.txt")
+    audit_parser.add_argument("--deep", "--http-probe", action="store_true", help="Run Deep HTTP delay probe on top nodes")
+    audit_parser.add_argument("--non-interactive", "-y", action="store_true", help="Run non-interactively without menu prompts")
 
     # config
     subparsers.add_parser("config", help="Configure Telegram token, channel, proxy and API endpoint")
