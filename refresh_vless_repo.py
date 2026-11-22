@@ -151,14 +151,19 @@ def telegram_source_enabled() -> bool:
     return bool(TG_API_ID and TG_API_HASH and VPN_SOURCE_CHANNELS)
 
 
-def dedupe_configs(configs: list[ParsedConfig]) -> list[ParsedConfig]:
+def dedupe_configs(configs: list[ParsedConfig], max_per_host_port: int = 2) -> list[ParsedConfig]:
     seen: set[tuple] = set()
+    host_port_counts: dict[tuple[str, int], int] = {}
     deduped: list[ParsedConfig] = []
     for cfg in configs:
         key = _build_config_key(cfg)
         if key in seen:
             continue
+        hp = (cfg.host.lower(), cfg.port)
+        if host_port_counts.get(hp, 0) >= max_per_host_port:
+            continue
         seen.add(key)
+        host_port_counts[hp] = host_port_counts.get(hp, 0) + 1
         deduped.append(cfg)
     return deduped
 
@@ -186,6 +191,10 @@ def normalize_urls(
         # Branded template: [Ультра] Германия #1 NOTAVLESS
         new_name = f"[{tier}] {country_name} #{idx} NOTAVLESS"
         base_url = cfg.raw_url.split("#", 1)[0]
+        # Ensure SNI is present in query parameters so clients don't fail certificate validation against raw IP
+        if cfg.sni and "sni=" not in base_url:
+            sep = "&" if "?" in base_url else "?"
+            base_url = f"{base_url}{sep}sni={urllib.parse.quote(cfg.sni)}"
         quoted_name = urllib.parse.quote(new_name)
         normalized.append(f"{base_url}#{quoted_name}")
 
@@ -479,21 +488,36 @@ async def check_node(cfg: ParsedConfig, timeout: float = 2.5) -> tuple[bool, flo
     if cfg.port in (80, 8080, 8880, 2086, 2082):
         return False, 9999.0
 
-    # 3. VLESS & Trojan: real TCP reachability check
+    # 3. Reject Cloudflare workers/pages which are hard-blocked by TSPU in Russia and cause x509 cert errors
+    blob = f"{cfg.host} {cfg.sni} {cfg.host_header}".lower()
+    if any(b in blob for b in (".workers.dev", ".pages.dev", "workers.dev", "pages.dev")):
+        return False, 9999.0
+
+    # 4. VLESS & Trojan: real TCP reachability & TLS protocol liveness check
     t0 = time.perf_counter()
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(cfg.host, cfg.port),
             timeout=timeout,
         )
+
+        # Probe TLS handshake liveness (detect EOF or dead drop sockets)
+        writer.write(b"\x16\x03\x01\x00\x05\x01\x00\x00\x01\x00")
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(1024), timeout=min(1.5, timeout * 0.7))
         rtt = (time.perf_counter() - t0) * 1000.0
+
         writer.close()
         try:
             await writer.wait_closed()
         except Exception:
             pass
 
-        # 4. For standard TLS (not Reality), verify TLS certificate handshake
+        # If server immediately closed with EOF (0 bytes) or hung, it's a dead socket / broken VLESS
+        if not data:
+            return False, 9999.0
+
+        # 5. For standard TLS (not Reality), verify TLS certificate handshake if SNI is available
         if cfg.security == "tls" and cfg.sni:
             try:
                 ssl_ctx = ssl.create_default_context()
@@ -512,10 +536,8 @@ async def check_node(cfg: ParsedConfig, timeout: float = 2.5) -> tuple[bool, flo
                     pass
                 return True, round(tls_rtt, 1)
             except Exception:
-                # Standard TLS handshake failed -> filter out
                 return False, 9999.0
 
-        # 5. For Reality, TCP connect confirms the Reality listener is reachable
         return True, round(rtt, 1)
     except Exception:
         return False, 9999.0
@@ -644,7 +666,8 @@ async def run_update_pipeline() -> dict:
     if len(fastest_pool) < 50:
         fastest_pool = [
             c for c in (vless_configs + trojan_configs)
-            if latencies_map.get((c.protocol, c.host, c.port), 9999.0) < 400.0
+            if latencies_map.get((c.protocol, c.host, c.port), 9999.0) < 450.0
+            and detect_country_info(c.remark, c.host, c.sni)[2] != "Сервер"
         ]
     fastest_configs = fastest_pool[:100] if fastest_pool else (vless_configs[:100])
     fastest_urls = normalize_urls(fastest_configs, latencies_map)

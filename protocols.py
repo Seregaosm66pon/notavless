@@ -113,6 +113,12 @@ def parse_vless_url(raw_url: str, added_by: str = "") -> ParsedConfig | None:
             return None
         if any(bad in host for bad in ("&", "=", "?", "/", " ", "\\", "#", ";")):
             return None
+        # Reject Iranian intranet hosts
+        if host.lower().endswith(".ir"):
+            return None
+        # Reject corrupt spam query parameters
+        if any(spam in parsed.query for spam in ("---@", "VPsave", "Fear_Config")):
+            return None
 
         try:
             UUID(user_id)
@@ -121,6 +127,13 @@ def parse_vless_url(raw_url: str, added_by: str = "") -> ParsedConfig | None:
                 return None
 
         params = parse_qs(parsed.query, keep_blank_values=True)
+        sni = _first_value(params, "sni")
+        host_header = _first_value(params, "host")
+        if not sni and host_header and "." in host_header and not host_header.replace(".", "").isdigit():
+            sni = host_header
+        elif not sni and "." in host and not host.replace(".", "").isdigit():
+            sni = host
+
         return ParsedConfig(
             protocol="vless",
             uuid=user_id,
@@ -130,8 +143,8 @@ def parse_vless_url(raw_url: str, added_by: str = "") -> ParsedConfig | None:
             security=_first_value(params, "security"),
             network_type=_first_value(params, "type"),
             path=unquote(_first_value(params, "path")),
-            host_header=_first_value(params, "host"),
-            sni=_first_value(params, "sni"),
+            host_header=host_header,
+            sni=sni,
             alpn=_first_value(params, "alpn"),
             fingerprint=_first_value(params, "fp"),
             public_key=_first_value(params, "pbk"),
@@ -159,6 +172,12 @@ def parse_trojan_url(raw_url: str, added_by: str = "") -> ParsedConfig | None:
         if not (1 <= port <= 65535):
             return None
         if any(bad in host for bad in ("&", "=", "?", "/", " ", "\\", "#", ";")):
+            return None
+        # Reject Iranian intranet hosts
+        if host.lower().endswith(".ir"):
+            return None
+        # Reject corrupt spam query parameters
+        if any(spam in parsed.query for spam in ("---@", "VPsave", "Fear_Config")):
             return None
 
         params = parse_qs(parsed.query, keep_blank_values=True)
@@ -204,6 +223,12 @@ def parse_hysteria2_url(raw_url: str, added_by: str = "") -> ParsedConfig | None
         if not (1 <= port <= 65535):
             return None
         if any(bad in host for bad in ("&", "=", "?", "/", " ", "\\", "#", ";")):
+            return None
+        # Reject Iranian intranet hosts
+        if host.lower().endswith(".ir"):
+            return None
+        # Reject corrupt spam query parameters
+        if any(spam in parsed.query for spam in ("---@", "VPsave", "Fear_Config")):
             return None
 
         params = parse_qs(parsed.query, keep_blank_values=True)
