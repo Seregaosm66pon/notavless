@@ -20,65 +20,112 @@ if load_dotenv:
 
 # Telegram Bot Token & Channel for auto updates
 DEFAULT_BOT_TOKEN = "8740400260:AAGeOM6eO27VfziUjmYGYeXgCVmQAF6eN-Y"
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", DEFAULT_BOT_TOKEN).strip()
-TG_NOTIFY_TOKEN = os.getenv("TG_NOTIFY_TOKEN", TG_BOT_TOKEN).strip()
-TG_NOTIFY_CHANNEL = os.getenv("TG_NOTIFY_CHANNEL", "@notavless").strip()
-TG_PROXY_URL = os.getenv("TG_PROXY_URL", "").strip()
-TG_API_ENDPOINT = os.getenv("TG_API_ENDPOINT", "https://api.telegram.org").strip().rstrip("/")
+
+
+def _get_str(key: str, default: str = "") -> str:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    val = val.strip()
+    return val if val else default
+
+
+def _get_int(key: str, default: int) -> int:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    val = val.strip()
+    if not val:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+def _get_float(key: str, default: float) -> float:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    val = val.strip()
+    if not val:
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        return default
+
+
+def _get_bool(key: str, default: bool = True) -> bool:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    val = val.strip().lower()
+    if not val:
+        return default
+    return val in ("true", "1", "yes")
+
+
+TG_BOT_TOKEN = _get_str("TG_BOT_TOKEN", DEFAULT_BOT_TOKEN)
+TG_NOTIFY_TOKEN = _get_str("TG_NOTIFY_TOKEN", TG_BOT_TOKEN)
+TG_NOTIFY_CHANNEL = _get_str("TG_NOTIFY_CHANNEL", "@notavless")
+TG_PROXY_URL = _get_str("TG_PROXY_URL", "")
+TG_API_ENDPOINT = _get_str("TG_API_ENDPOINT", "https://api.telegram.org").rstrip("/")
 
 # Update schedule settings
-UPDATE_INTERVAL_HOURS = int(os.getenv("UPDATE_INTERVAL_HOURS", "2"))
+UPDATE_INTERVAL_HOURS = _get_int("UPDATE_INTERVAL_HOURS", 2)
 UPDATE_INTERVAL_SECONDS = UPDATE_INTERVAL_HOURS * 3600
 
 # Telegram Userbot settings (optional for private channels)
-TG_API_ID = int(os.getenv("TG_API_ID", "0"))
-TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
-TG_SESSION_NAME = os.getenv("TG_SESSION_NAME", "vpn_userbot").strip()
-TG_SESSION_STRING = os.getenv("TG_SESSION_STRING", "").strip()
+TG_API_ID = _get_int("TG_API_ID", 0)
+TG_API_HASH = _get_str("TG_API_HASH", "")
+TG_SESSION_NAME = _get_str("TG_SESSION_NAME", "vpn_userbot")
+TG_SESSION_STRING = _get_str("TG_SESSION_STRING", "")
 VPN_SOURCE_CHANNELS = [
     item.strip()
-    for item in os.getenv("VPN_SOURCE_CHANNELS", "").split(",")
+    for item in _get_str("VPN_SOURCE_CHANNELS", "").split(",")
     if item.strip()
 ]
-VPN_CHANNEL_MESSAGE_LIMIT = int(os.getenv("VPN_CHANNEL_MESSAGE_LIMIT", "50"))
+VPN_CHANNEL_MESSAGE_LIMIT = _get_int("VPN_CHANNEL_MESSAGE_LIMIT", 50)
 
-GITHUB_VLESS_RAW_URL = os.getenv("GITHUB_VLESS_RAW_URL", "").strip()
+GITHUB_VLESS_RAW_URL = _get_str("GITHUB_VLESS_RAW_URL", "")
+_raw_urls_val = _get_str("GITHUB_VLESS_RAW_URLS", "") or GITHUB_VLESS_RAW_URL
 GITHUB_VLESS_RAW_URLS = [
     item.strip()
-    for item in os.getenv("GITHUB_VLESS_RAW_URLS", os.getenv("GITHUB_VLESS_RAW_URL", "")).split(",")
+    for item in _raw_urls_val.split(",")
     if item.strip()
 ]
-SOURCES_FILE = os.getenv("SOURCES_FILE", str(REPO_ROOT / "sources.txt"))
+SOURCES_FILE = _get_str("SOURCES_FILE", str(REPO_ROOT / "sources.txt"))
 
 # Subscription output filenames
 # 1. Mega / Universal subscription (WiFi + LTE, all protocols)
-MEGA_SUBSCRIPTION_OUTPUT = os.getenv("MEGA_SUBSCRIPTION_OUTPUT", "mega_sub.txt").strip()
-MEGA_SUBSCRIPTION_URL = os.getenv(
+MEGA_SUBSCRIPTION_OUTPUT = _get_str("MEGA_SUBSCRIPTION_OUTPUT", "mega_sub.txt")
+MEGA_SUBSCRIPTION_URL = _get_str(
     "MEGA_SUBSCRIPTION_URL",
     "https://raw.githubusercontent.com/Seregaosm66pon/notavless/main/mega_sub.txt",
-).strip()
-MEGA_FASTEST_OUTPUT = os.getenv("MEGA_FASTEST_OUTPUT", "mega_sub_fastest.txt").strip()
-MEGA_FASTEST_URL = os.getenv(
+)
+MEGA_FASTEST_OUTPUT = _get_str("MEGA_FASTEST_OUTPUT", "mega_sub_fastest.txt")
+MEGA_FASTEST_URL = _get_str(
     "MEGA_FASTEST_URL",
     "https://raw.githubusercontent.com/Seregaosm66pon/notavless/main/mega_sub_fastest.txt",
-).strip()
+)
 
 # 2. VLESS files (All / Legacy / LTE / WiFi)
-VPN_SUBSCRIPTION_OUTPUT = os.getenv("VPN_SUBSCRIPTION_OUTPUT", "vlessall.txt").strip()
-VPN_SUBSCRIPTION_OUTPUT_LEGACY = os.getenv("VPN_SUBSCRIPTION_OUTPUT_LEGACY", "vless_subscription.txt").strip()
-VPN_SUBSCRIPTION_OUTPUT_LTE = os.getenv("VPN_SUBSCRIPTION_OUTPUT_LTE", "vless_lte.txt").strip()
-VPN_SUBSCRIPTION_OUTPUT_WIFI = os.getenv("VPN_SUBSCRIPTION_OUTPUT_WIFI", "vless_wifi.txt").strip()
+VPN_SUBSCRIPTION_OUTPUT = _get_str("VPN_SUBSCRIPTION_OUTPUT", "vlessall.txt")
+VPN_SUBSCRIPTION_OUTPUT_LEGACY = _get_str("VPN_SUBSCRIPTION_OUTPUT_LEGACY", "vless_subscription.txt")
+VPN_SUBSCRIPTION_OUTPUT_LTE = _get_str("VPN_SUBSCRIPTION_OUTPUT_LTE", "vless_lte.txt")
+VPN_SUBSCRIPTION_OUTPUT_WIFI = _get_str("VPN_SUBSCRIPTION_OUTPUT_WIFI", "vless_wifi.txt")
 
 # 3. Protocol specific files
-TROJAN_SUBSCRIPTION_OUTPUT = os.getenv("TROJAN_SUBSCRIPTION_OUTPUT", "trojan.txt").strip()
-HYSTERIA2_SUBSCRIPTION_OUTPUT = os.getenv("HYSTERIA2_SUBSCRIPTION_OUTPUT", "hysteria2.txt").strip()
+TROJAN_SUBSCRIPTION_OUTPUT = _get_str("TROJAN_SUBSCRIPTION_OUTPUT", "trojan.txt")
+HYSTERIA2_SUBSCRIPTION_OUTPUT = _get_str("HYSTERIA2_SUBSCRIPTION_OUTPUT", "hysteria2.txt")
 
 # Base64 output toggle
-GENERATE_BASE64 = os.getenv("GENERATE_BASE64", "true").lower() in ("true", "1", "yes")
+GENERATE_BASE64 = _get_bool("GENERATE_BASE64", True)
 
 # Health check settings
-CHECK_CONCURRENCY = int(os.getenv("CHECK_CONCURRENCY", "64"))
-CHECK_TIMEOUT = float(os.getenv("CHECK_TIMEOUT", "2.5"))
+CHECK_CONCURRENCY = _get_int("CHECK_CONCURRENCY", 64)
+CHECK_TIMEOUT = _get_float("CHECK_TIMEOUT", 2.5)
 
-VPN_GIT_COMMIT_MESSAGE = os.getenv("VPN_GIT_COMMIT_MESSAGE", "Update VLESS/Trojan/Hy2 subscriptions").strip()
-URL_TEST_TARGET = os.getenv("URL_TEST_TARGET", "http://www.gstatic.com/generate_204").strip()
+VPN_GIT_COMMIT_MESSAGE = _get_str("VPN_GIT_COMMIT_MESSAGE", "Update VLESS/Trojan/Hy2 subscriptions")
+URL_TEST_TARGET = _get_str("URL_TEST_TARGET", "http://www.gstatic.com/generate_204")

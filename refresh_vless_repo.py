@@ -292,7 +292,13 @@ def push_if_changed(changed_paths: list[Path]) -> str:
     if commit_result.returncode != 0:
         return f"commit failed: {_sanitize_error(commit_result.stderr.strip() or commit_result.stdout.strip())}"
 
-    push_result = run_git(["push"])
+    push_result = run_git(["push", "origin", "HEAD:main"])
+    if push_result.returncode != 0:
+        # Remote may have advanced; try pull --rebase and retry
+        run_git(["pull", "--rebase", "origin", "main"])
+        push_result = run_git(["push", "origin", "HEAD:main"])
+    if push_result.returncode != 0:
+        push_result = run_git(["push"])
     if push_result.returncode != 0:
         return f"push failed: {_sanitize_error(push_result.stderr.strip() or push_result.stdout.strip())}"
 
@@ -755,6 +761,9 @@ async def run_update_pipeline() -> dict:
     )
 
     await send_notification(msg)
+
+    if git_status.startswith("push failed:") or git_status.startswith("commit failed:"):
+        raise RuntimeError(f"Git publication failed: {git_status}")
 
     return {
         "total_candidates": result["total_candidates"],
