@@ -18,6 +18,7 @@ import struct
 import subprocess
 import tempfile
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
@@ -201,6 +202,9 @@ def detect_country_info(remark: str, host: str = "", sni: str = "") -> tuple[str
     Extract (code, flag, russian_name) using emoji flags, Russian country names,
     English keywords, subdomains, and host cues.
     """
+    if remark:
+        remark = urllib.parse.unquote(remark)
+
     # 1. Direct emoji flag in remark
     match = FLAG_EMOJI_RE.search(remark)
     if match:
@@ -317,6 +321,8 @@ def find_sing_box_executable() -> str | None:
         os.environ.get("SING_BOX_PATH", ""),
         r"C:\Program Files\FlyFrogLLC\Happ\tun\sing-box.exe",
         r"C:\Program Files\sing-box\sing-box.exe",
+        "/usr/local/bin/sing-box",
+        "/usr/bin/sing-box",
         str(REPO_ROOT / "sing-box.exe"),
     ]
     for c in candidates:
@@ -334,6 +340,8 @@ def find_xray_executable() -> str | None:
         os.environ.get("XRAY_PATH", ""),
         r"C:\Program Files\FlyFrogLLC\Happ\core\xray.exe",
         r"C:\Program Files\AmneziaVPN\xray\xray.exe",
+        "/usr/local/bin/xray",
+        "/usr/bin/xray",
         str(REPO_ROOT / "xray.exe"),
     ]
     for c in candidates:

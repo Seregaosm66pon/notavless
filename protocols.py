@@ -80,7 +80,7 @@ def decode_maybe_base64(text: str) -> str:
 
 
 def sanitize_proxy_url(match_str: str) -> str:
-    cleaned = match_str.rstrip(".,);]>\"'")
+    cleaned = match_str.rstrip(".,);]>\"'*_~\\")
     cleaned = html.unescape(cleaned).replace("&amp;", "&")
     return cleaned
 
@@ -117,7 +117,8 @@ def parse_vless_url(raw_url: str, added_by: str = "") -> ParsedConfig | None:
         if host.lower().endswith(".ir"):
             return None
         # Reject corrupt spam query parameters
-        if any(spam in parsed.query for spam in ("---@", "VPsave", "Fear_Config")):
+        query_lower = parsed.query.lower()
+        if any(spam in query_lower for spam in ("---@", "vpsave", "fear_config")):
             return None
 
         try:
@@ -164,7 +165,7 @@ def parse_trojan_url(raw_url: str, added_by: str = "") -> ParsedConfig | None:
 
     try:
         parsed = urlparse(raw_url)
-        password = (parsed.username or "").strip()
+        password = unquote((parsed.username or "").strip())
         host = (parsed.hostname or "").strip()
         port = parsed.port
         if not password or not host or not port:
@@ -177,7 +178,8 @@ def parse_trojan_url(raw_url: str, added_by: str = "") -> ParsedConfig | None:
         if host.lower().endswith(".ir"):
             return None
         # Reject corrupt spam query parameters
-        if any(spam in parsed.query for spam in ("---@", "VPsave", "Fear_Config")):
+        query_lower = parsed.query.lower()
+        if any(spam in query_lower for spam in ("---@", "vpsave", "fear_config")):
             return None
 
         params = parse_qs(parsed.query, keep_blank_values=True)
@@ -228,7 +230,8 @@ def parse_hysteria2_url(raw_url: str, added_by: str = "") -> ParsedConfig | None
         if host.lower().endswith(".ir"):
             return None
         # Reject corrupt spam query parameters
-        if any(spam in parsed.query for spam in ("---@", "VPsave", "Fear_Config")):
+        query_lower = parsed.query.lower()
+        if any(spam in query_lower for spam in ("---@", "vpsave", "fear_config")):
             return None
 
         params = parse_qs(parsed.query, keep_blank_values=True)

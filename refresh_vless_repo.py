@@ -294,9 +294,12 @@ def push_if_changed(changed_paths: list[Path]) -> str:
 
     push_result = run_git(["push", "origin", "HEAD:main"])
     if push_result.returncode != 0:
-        # Remote may have advanced; try pull --rebase and retry
-        run_git(["pull", "--rebase", "origin", "main"])
-        push_result = run_git(["push", "origin", "HEAD:main"])
+        # Remote may have advanced; try pull --rebase with preference to our generated files
+        rebase_pull = run_git(["pull", "--rebase", "-X", "theirs", "origin", "main"])
+        if rebase_pull.returncode != 0:
+            run_git(["rebase", "--abort"])
+        else:
+            push_result = run_git(["push", "origin", "HEAD:main"])
     if push_result.returncode != 0:
         push_result = run_git(["push"])
     if push_result.returncode != 0:
@@ -760,10 +763,10 @@ async def run_update_pipeline() -> dict:
         git_status,
     )
 
-    await send_notification(msg)
-
     if git_status.startswith("push failed:") or git_status.startswith("commit failed:"):
         raise RuntimeError(f"Git publication failed: {git_status}")
+
+    await send_notification(msg)
 
     return {
         "total_candidates": result["total_candidates"],
