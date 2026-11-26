@@ -29,10 +29,33 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Cache and install sing-box & Xray cores for real HTTP 204 verification
+        id: cache-cores
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/proxy-cores
+          key: proxy-cores-sb1.14.4-xr26.11.9
+
+      - name: Download sing-box and Xray binaries if not cached
+        if: steps.cache-cores.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /usr/local/bin/proxy-cores
+          curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz" -o /tmp/sb.tar.gz
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          cp /tmp/sing-box-1.14.4-linux-amd64/sing-box /usr/local/bin/proxy-cores/sing-box
+          chmod +x /usr/local/bin/proxy-cores/sing-box
+          curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-64.zip" -o /tmp/xr.zip
+          unzip -q -o /tmp/xr.zip xray -d /usr/local/bin/proxy-cores
+          chmod +x /usr/local/bin/proxy-cores/xray
+
+      - name: Expose proxy cores on PATH
+        run: |
+          echo "/usr/local/bin/proxy-cores" >> $GITHUB_PATH
 
       - name: Run unit test suite
         run: |

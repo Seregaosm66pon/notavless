@@ -1,7 +1,9 @@
 """
 Nota Vless - Ultimate High-Speed Proxy Health Checker & Latency Benchmark.
 Cyberpunk / Rich-powered terminal UI with real-time animated stats,
-multi-sample jitter calculations, DPI / TSPU liveness detection, and one-click copy.
+multi-sample jitter calculations, genuine TLS 1.3 SNI ClientHello DPI probes,
+dual-core (sing-box + Xray) end-to-end HTTP tunneling, bandwidth speedtests,
+and one-click clipboard export.
 """
 
 from __future__ import annotations
@@ -9,14 +11,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import math
-import os
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
 
 # Ensure UTF-8 output on Windows consoles
 if sys.platform == "win32":
@@ -30,10 +29,9 @@ from rich import box
 from rich.align import Align
 from rich.columns import Columns
 from rich.console import Console, Group
-from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 from rich.text import Text
 
@@ -41,38 +39,112 @@ from checker import (
     NodeCheckResult,
     benchmark_nodes,
     build_health_report,
+    build_tls_client_hello,
     check_node_advanced,
     detect_country_info,
+    enrich_results_geoip,
     find_sing_box_executable,
     find_xray_executable,
     get_security_tag,
     make_sparkline,
+    measure_node_speed,
     probe_nodes_http_batch,
+    probe_proxy_exit_ip,
     probe_proxy_http,
 )
 from config import (
+    HYSTERIA2_SUBSCRIPTION_OUTPUT,
+    MEGA_FASTEST_OUTPUT,
     MEGA_FASTEST_URL,
     MEGA_SUBSCRIPTION_OUTPUT,
     MEGA_SUBSCRIPTION_URL,
     REPO_ROOT,
+    TROJAN_SUBSCRIPTION_OUTPUT,
+    VPN_SUBSCRIPTION_OUTPUT,
+    VPN_SUBSCRIPTION_OUTPUT_LTE,
+    VPN_SUBSCRIPTION_OUTPUT_WIFI,
 )
 from protocols import ParsedConfig, parse_any_proxy_url
+from refresh_vless_repo import normalize_urls, write_base64_file, write_output_file
 
 console = Console()
 
+SOURCE_ALIASES: dict[str, Path] = {
+    "mega": REPO_ROOT / MEGA_SUBSCRIPTION_OUTPUT,
+    "fastest": REPO_ROOT / MEGA_FASTEST_OUTPUT,
+    "all": REPO_ROOT / VPN_SUBSCRIPTION_OUTPUT,
+    "lte": REPO_ROOT / VPN_SUBSCRIPTION_OUTPUT_LTE,
+    "wifi": REPO_ROOT / VPN_SUBSCRIPTION_OUTPUT_WIFI,
+    "trojan": REPO_ROOT / TROJAN_SUBSCRIPTION_OUTPUT,
+    "hy2": REPO_ROOT / HYSTERIA2_SUBSCRIPTION_OUTPUT,
+    "local": REPO_ROOT / "local_fastest.txt",
+}
+
 
 def copy_to_clipboard(text: str) -> bool:
-    """Copy text to Windows clipboard using native clip command."""
+    """Copy text to OS clipboard (Windows clip, macOS pbcopy, Linux wl-copy/xclip/xsel)."""
     try:
-        p = subprocess.Popen(["clip"], stdin=subprocess.PIPE, shell=True)
-        p.communicate(text.encode("utf-16le"))
-        return p.returncode == 0
+        if sys.platform == "win32":
+            p = subprocess.Popen(["clip"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-16le"))
+            return p.returncode == 0
+        if sys.platform == "darwin":
+            p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            return p.returncode == 0
+        for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                p.communicate(text.encode("utf-8"))
+                if p.returncode == 0:
+                    return True
+            except FileNotFoundError:
+                continue
     except Exception:
-        return False
+        pass
+    return False
+
+
+def _resolve_source_file(source: str) -> Path:
+    key = (source or "mega").strip().lower()
+    if key in SOURCE_ALIASES:
+        return SOURCE_ALIASES[key]
+    cand = Path(source)
+    if cand.is_absolute():
+        return cand
+    return REPO_ROOT / cand
+
+
+def _filter_configs(
+    configs: list[ParsedConfig],
+    country: str = "",
+    proto: str = "",
+) -> list[ParsedConfig]:
+    filtered = configs
+    c_filter = (country or "").strip().lower()
+    if c_filter:
+        out: list[ParsedConfig] = []
+        for cfg in filtered:
+            code, _, ru_name = detect_country_info(cfg.remark, cfg.host, cfg.sni)
+            if c_filter == code.lower() or c_filter in ru_name.lower() or c_filter in cfg.remark.lower():
+                out.append(cfg)
+        filtered = out
+
+    p_filter = (proto or "").strip().lower()
+    if p_filter:
+        if p_filter == "reality":
+            filtered = [c for c in filtered if c.security.lower() == "reality"]
+        elif p_filter in ("hy2", "hysteria2"):
+            filtered = [c for c in filtered if c.protocol.lower() == "hysteria2"]
+        elif p_filter in ("xhttp", "ws", "grpc", "tcp"):
+            filtered = [c for c in filtered if (c.network_type or "tcp").lower() == p_filter]
+        else:
+            filtered = [c for c in filtered if c.protocol.lower() == p_filter]
+    return filtered
 
 
 def get_hero_banner() -> Panel:
-    """Return stylized cyberpunk ASCII hero banner with engine badge."""
+    """Return stylized cyberpunk ASCII hero banner with active engine badges."""
     ascii_art = r"""
  ███╗   ██╗ ██████╗ ████████╗ █████╗     ██╗   ██╗██╗     ███████╗███████╗
  ████╗  ██║██╔═══██╗╚══██╔══╝██╔══██╗    ██║   ██║██║     ██╔════╝██╔════╝
@@ -84,23 +156,32 @@ def get_hero_banner() -> Panel:
 
     banner_text = Text(ascii_art, style="bold cyan")
     sub = Text(
-        "VLESS Reality (XTLS-Vision) • Trojan TLS 1.3 • Hysteria 2 • Anti-TSPU Handshake Audit",
+        "VLESS (Reality / Vision / WS / gRPC / xHTTP) • Trojan TLS 1.3 • Hysteria 2 • TSPU Audit",
         style="bold magenta",
     )
     elements = [Align.center(banner_text), Align.center(sub)]
     sb_bin = find_sing_box_executable()
     xray_bin = find_xray_executable()
-    if sb_bin:
+    if sb_bin and xray_bin:
         elements.append(
-            Align.center(Text("⚡ Core: sing-box (Real HTTP Tunnel Audit Engine Active)", style="bold green"))
+            Align.center(
+                Text(
+                    "⚡ Dual-Core Active: sing-box (Clash API) + Xray (xHTTP/Reality Tunnel + Speedtest)",
+                    style="bold green",
+                )
+            )
+        )
+    elif sb_bin:
+        elements.append(
+            Align.center(Text("⚡ Core: sing-box (Clash API Real HTTP Tunnel Active)", style="bold green"))
         )
     elif xray_bin:
         elements.append(
-            Align.center(Text("⚡ Core: Xray (Audit Engine Active)", style="bold green"))
+            Align.center(Text("⚡ Core: Xray (Multi-Inbound HTTP Tunnel + Speedtest Active)", style="bold green"))
         )
     else:
         elements.append(
-            Align.center(Text("⚡ Core: Native Python Hybrid Sockets (DPI/TLS Audit Active)", style="dim cyan"))
+            Align.center(Text("⚡ Core: Native Python TLS 1.3 SNI ClientHello Sockets", style="dim cyan"))
         )
     return Panel(
         Group(*elements),
@@ -129,16 +210,13 @@ def render_distribution_bar(rep: dict) -> Text:
     """Create a proportional colored visual bar for latency tiers."""
     total = rep["total"] or 1
     tiers = rep["tiers"]
-    dead = rep["dead"]
 
-    bar_len = 40
+    bar_len = 44
     u_len = int(round(tiers["ultra"] / total * bar_len))
     f_len = int(round(tiers["fast"] / total * bar_len))
     n_len = int(round(tiers["normal"] / total * bar_len))
     s_len = int(round(tiers["slow"] / total * bar_len))
-    d_len = bar_len - (u_len + f_len + n_len + s_len)
-    if d_len < 0:
-        d_len = 0
+    d_len = max(0, bar_len - (u_len + f_len + n_len + s_len))
 
     bar = Text()
     bar.append("█" * u_len, style="bold cyan")
@@ -150,11 +228,12 @@ def render_distribution_bar(rep: dict) -> Text:
 
 
 class BenchmarkSessionUI:
-    """Interactive live benchmark coordinator with Rich Live display."""
+    """Interactive live benchmark coordinator with throttled Rich Live display."""
 
-    def __init__(self, configs: list[ParsedConfig], concurrency: int = 48) -> None:
+    def __init__(self, configs: list[ParsedConfig], concurrency: int = 48, label: str = "mega_sub.txt") -> None:
         self.configs = configs
         self.concurrency = concurrency
+        self.label = label
         self.total = len(configs)
         self.completed = 0
         self.results: list[NodeCheckResult] = []
@@ -167,17 +246,20 @@ class BenchmarkSessionUI:
         self.c_normal = 0
         self.c_slow = 0
         self.c_dead = 0
+        self.c_tls_ok = 0
         self.live_pings: list[float] = []
 
     def on_node_done(self, done: int, total: int, res: NodeCheckResult) -> None:
         self.completed = done
         self.results.append(res)
         self.recent_events.append(res)
-        if len(self.recent_events) > 7:
+        if len(self.recent_events) > 8:
             self.recent_events.pop(0)
 
         if res.alive:
             self.live_pings.append(res.latency_ms)
+            if res.tls_ok:
+                self.c_tls_ok += 1
             if res.quality_tier == "⚡ ULTRA":
                 self.c_ultra += 1
             elif res.quality_tier == "🟢 FAST":
@@ -196,16 +278,14 @@ class BenchmarkSessionUI:
         rem_sec = (self.total - self.completed) / speed if speed > 0.1 else 0.0
 
         # 1. Header Progress Bar
-        bar_width = 30
+        bar_width = 34
         filled = int(bar_width * (self.completed / self.total)) if self.total else 0
-        progress_bar = (
-            f"[bold cyan]{'━' * filled}[/][bright_black]{'━' * (bar_width - filled)}[/]"
-        )
+        progress_bar = f"[bold cyan]{'━' * filled}[/][bright_black]{'━' * (bar_width - filled)}[/]"
 
         prog_text = Text()
-        prog_text.append(f"Тестирование: {self.completed}/{self.total} ({pct:>5.1f}%) ", style="bold white")
-        prog_text.append(f" Скорость: {speed:.1f} узлов/сек ", style="bold yellow")
-        prog_text.append(f" Время: {elapsed:.1f}s (Осталось: ~{rem_sec:.0f}s)", style="dim")
+        prog_text.append(f"[{self.label}] {self.completed}/{self.total} ({pct:>5.1f}%) ", style="bold white")
+        prog_text.append(f" • {speed:.1f} узлов/сек ", style="bold yellow")
+        prog_text.append(f" • {elapsed:.1f}s (осталось ~{rem_sec:.0f}s)", style="dim")
 
         header_panel = Panel(
             Group(
@@ -223,15 +303,18 @@ class BenchmarkSessionUI:
         avg_ping = (sum(self.live_pings) / len(self.live_pings)) if self.live_pings else 0.0
         best_ping = min(self.live_pings) if self.live_pings else 0.0
 
-        cards = Columns([
-            make_stat_card("⚡ УЛЬТРА", str(self.c_ultra), "cyan", "< 85ms"),
-            make_stat_card("🟢 БЫСТРЫЕ", str(self.c_fast), "green", "85-180ms"),
-            make_stat_card("🟡 НОРМА", str(self.c_normal), "yellow", "180-350ms"),
-            make_stat_card("🔴 МЕДЛЕННЫЕ", str(self.c_slow), "red", "> 350ms"),
-            make_stat_card("💀 МЕРТВЫЕ", str(self.c_dead), "bright_black", "RST/Drop"),
-            make_stat_card("📊 УСПЕХ", f"{success_rate:.1f}%", "magenta", f"Живых: {len(self.live_pings)}"),
-            make_stat_card("⚡ СРЕДНИЙ", f"{avg_ping:.0f} ms", "bright_white", f"Лучший: {best_ping:.0f}ms"),
-        ], expand=True)
+        cards = Columns(
+            [
+                make_stat_card("⚡ УЛЬТРА", str(self.c_ultra), "cyan", "< 85ms"),
+                make_stat_card("🟢 БЫСТРЫЕ", str(self.c_fast), "green", "85-180ms"),
+                make_stat_card("🟡 НОРМА", str(self.c_normal), "yellow", "180-350ms"),
+                make_stat_card("🔴 МЕДЛЕН", str(self.c_slow), "red", "> 350ms"),
+                make_stat_card("💀 МЕРТВЫЕ", str(self.c_dead), "bright_black", "RST/Drop"),
+                make_stat_card("🔒 TLS/SNI", str(self.c_tls_ok), "bright_green", f"Успех {success_rate:.0f}%"),
+                make_stat_card("⚡ ЛУЧШИЙ", f"{best_ping:.0f} ms", "bright_white", f"Сред: {avg_ping:.0f}ms"),
+            ],
+            expand=True,
+        )
 
         # 3. Rolling Live Events Table
         feed_table = Table(
@@ -241,16 +324,16 @@ class BenchmarkSessionUI:
             header_style="bold magenta",
             padding=(0, 1),
         )
-        feed_table.add_column("Статус", width=12)
+        feed_table.add_column("Статус", width=11)
         feed_table.add_column("Флаг", width=4, justify="center")
-        feed_table.add_column("Протокол & Защита", width=22)
+        feed_table.add_column("Протокол & Транспорт", width=24)
         feed_table.add_column("Сервер / Порт", width=22)
-        feed_table.add_column("Пинг (RTT)", width=12, justify="right")
-        feed_table.add_column("Джиттер", width=10, justify="right")
-        feed_table.add_column("График", width=8, justify="center")
-        feed_table.add_column("SNI / Маскировка", width=22)
+        feed_table.add_column("RTT", width=9, justify="right")
+        feed_table.add_column("Джиттер", width=9, justify="right")
+        feed_table.add_column("График", width=7, justify="center")
+        feed_table.add_column("SNI / Диагностика", width=24)
 
-        for res in self.recent_events[-7:]:
+        for res in self.recent_events[-8:]:
             flag = res.country_flag or "🌐"
             cfg = res.config
             sec_disp = res.security_tag or cfg.security.upper()
@@ -259,11 +342,20 @@ class BenchmarkSessionUI:
             sni_disp = cfg.sni or "-"
 
             if res.alive:
-                tier_color = "cyan" if "ULTRA" in res.quality_tier else "green" if "FAST" in res.quality_tier else "yellow" if "NORMAL" in res.quality_tier else "red"
+                tier_color = (
+                    "cyan" if "ULTRA" in res.quality_tier
+                    else "green" if "FAST" in res.quality_tier
+                    else "yellow" if "NORMAL" in res.quality_tier
+                    else "red"
+                )
                 status_txt = f"[{tier_color}]{res.quality_tier}[/]"
-                ping_txt = f"[bold {tier_color}]{res.latency_ms:.1f} ms[/]"
-                jit_txt = f"[dim]±{res.jitter_ms:.1f}ms[/]"
+                ping_txt = f"[bold {tier_color}]{res.latency_ms:.0f} ms[/]"
+                jit_txt = f"[dim]±{res.jitter_ms:.0f}ms[/]"
                 spark_txt = f"[{tier_color}]{res.sparkline}[/]"
+                if res.tls_ok:
+                    sni_disp = f"[green]✔[/] {sni_disp[:21]}"
+                else:
+                    sni_disp = f"[yellow]⚠[/] {res.tls_detail or sni_disp[:21]}"
             else:
                 status_txt = "[dim red]💀 DEAD[/]"
                 ping_txt = "[dim]--[/]"
@@ -293,7 +385,17 @@ class BenchmarkSessionUI:
         return Group(header_panel, cards, events_panel)
 
 
-def display_results_dashboard(rep: dict, results: list[NodeCheckResult]) -> None:
+def _save_local_fastest(alive_nodes: list[NodeCheckResult], latencies_map: dict[tuple[str, str, int], float]) -> Path:
+    """Export normalized tested nodes with subscription headers to local_fastest.txt (+ Base64)."""
+    top_cfgs = [r.config for r in alive_nodes[:100]]
+    urls = normalize_urls(top_cfgs, latencies_map)
+    local_path = REPO_ROOT / "local_fastest.txt"
+    write_output_file(urls, local_path, "Nota Vless Local Fastest")
+    write_base64_file(urls, REPO_ROOT / "local_fastest_base64.txt")
+    return local_path
+
+
+def display_results_dashboard(rep: dict, results: list[NodeCheckResult], source_label: str = "mega_sub.txt") -> None:
     """Render the ultimate showstopper results screen."""
     console.print()
     console.print(get_hero_banner())
@@ -303,31 +405,35 @@ def display_results_dashboard(rep: dict, results: list[NodeCheckResult]) -> None
     alive = rep["alive"]
     dead = rep["dead"]
     pct = rep["success_rate_pct"]
+    http_verified = rep.get("http_verified", 0)
+    tls_verified = rep.get("tls_verified", 0)
 
     # 1. Global Metrics Summary
-    summary_table = Table.grid(expand=True, padding=(0, 2))
-    summary_table.add_column(justify="center")
-    summary_table.add_column(justify="center")
-    summary_table.add_column(justify="center")
-    summary_table.add_column(justify="center")
-    summary_table.add_column(justify="center")
+    summary_table = Table.grid(expand=True, padding=(0, 1))
+    for _ in range(6):
+        summary_table.add_column(justify="center")
 
     summary_table.add_row(
-        Panel(f"[bold cyan]{total}[/]\n[dim]Всего проверено[/]", box=box.ROUNDED, border_style="cyan"),
-        Panel(f"[bold green]{alive}[/] [dim]({pct}%)[/]\n[dim]Рабочих серверов[/]", box=box.ROUNDED, border_style="green"),
-        Panel(f"[bold red]{dead}[/]\n[dim]Мертвых / Блок РКН[/]", box=box.ROUNDED, border_style="red"),
-        Panel(f"[bold yellow]{rep['avg_ping_ms']:.1f} ms[/]\n[dim]Средний пинг пула[/]", box=box.ROUNDED, border_style="yellow"),
-        Panel(f"[bold bright_green]{rep['min_ping_ms']:.1f} ms[/]\n[dim]Рекордный пинг[/]", box=box.ROUNDED, border_style="bright_green"),
+        Panel(f"[bold cyan]{total}[/]\n[dim]Проверено ({source_label})[/]", box=box.ROUNDED, border_style="cyan"),
+        Panel(f"[bold green]{alive}[/] [dim]({pct}%)[/]\n[dim]Доступных TCP/UDP[/]", box=box.ROUNDED, border_style="green"),
+        Panel(f"[bold bright_cyan]{tls_verified}[/]\n[dim]TLS/SNI Valid[/]", box=box.ROUNDED, border_style="bright_cyan"),
+        Panel(f"[bold bright_green]{http_verified}[/]\n[dim]HTTP 204 Tunnel ✔[/]", box=box.ROUNDED, border_style="bright_green"),
+        Panel(f"[bold yellow]{rep['avg_ping_ms']:.1f} ms[/]\n[dim]Средний пинг[/]", box=box.ROUNDED, border_style="yellow"),
+        Panel(f"[bold red]{dead}[/]\n[dim]Мертвых / ТСПУ[/]", box=box.ROUNDED, border_style="red"),
     )
 
-    # 2. Latency Spectrum Bar
+    # 2. Latency Spectrum & Protocol Breakdown Bar
     dist_bar = render_distribution_bar(rep)
+    protos = rep.get("protocols", {})
+    sec = rep.get("security", {})
     dist_legend = Text.from_markup(
-        f"[bold cyan]⚡ {rep['tiers']['ultra']} Ультра (<85ms)[/]  •  "
-        f"[bold green]🟢 {rep['tiers']['fast']} Быстрые (85-180ms)[/]  •  "
-        f"[bold yellow]🟡 {rep['tiers']['normal']} Норма (180-350ms)[/]  •  "
-        f"[bold red]🔴 {rep['tiers']['slow']} Медленные (>350ms)[/]  •  "
-        f"[dim red]💀 {rep['dead']} Мертвые[/]"
+        f"[bold cyan]⚡ {rep['tiers']['ultra']} Ультра[/] • "
+        f"[bold green]🟢 {rep['tiers']['fast']} Быстрых[/] • "
+        f"[bold yellow]🟡 {rep['tiers']['normal']} Норма[/] • "
+        f"[bold red]🔴 {rep['tiers']['slow']} Медл[/] • "
+        f"[dim red]💀 {rep['dead']} Мертвых[/]\n"
+        f"[dim]Протоколы: VLESS={protos.get('vless', 0)} (Reality={sec.get('reality', 0)}, TLS={sec.get('tls', 0)}) • "
+        f"Trojan={protos.get('trojan', 0)} • Hysteria2={protos.get('hysteria2', 0)} • Лучший={rep['min_ping_ms']:.1f}ms[/]"
     )
 
     spectrum_panel = Panel(
@@ -336,7 +442,7 @@ def display_results_dashboard(rep: dict, results: list[NodeCheckResult]) -> None
             Text(),
             Align.center(dist_legend),
         ),
-        title="[bold bright_white]📊 СПЕКТР ЗАДЕРЖЕК И КАЧЕСТВА ПУЛА[/]",
+        title="[bold bright_white]📊 СПЕКТР ЗАДЕРЖЕК И СОСТАВ ПУЛА[/]",
         border_style="bright_blue",
         box=box.ROUNDED,
         padding=(0, 1),
@@ -357,14 +463,14 @@ def display_results_dashboard(rep: dict, results: list[NodeCheckResult]) -> None
     )
     top_table.add_column("№", justify="center", width=5)
     top_table.add_column("Страна", width=16)
-    top_table.add_column("Протокол", width=9)
-    top_table.add_column("Защита & Маскировка", width=22)
+    top_table.add_column("Протокол", width=8)
+    top_table.add_column("Защита & Транспорт", width=23)
     top_table.add_column("Сервер (Host:Port)", width=23)
-    top_table.add_column("Пинг (RTT)", justify="right", width=12)
-    top_table.add_column("Джиттер", justify="right", width=10)
-    top_table.add_column("Стабильность", justify="center", width=14)
-    top_table.add_column("Реальный трафик", justify="center", width=18)
-    top_table.add_column("Качество", justify="center", width=12)
+    top_table.add_column("TCP RTT", justify="right", width=10)
+    top_table.add_column("Джиттер", justify="right", width=9)
+    top_table.add_column("График", justify="center", width=8)
+    top_table.add_column("Туннель & Скорость", justify="center", width=22)
+    top_table.add_column("Качество", justify="center", width=11)
 
     medals = ["🥇 #1", "🥈 #2", "🥉 #3"]
     for idx, node in enumerate(rep["fastest_nodes"][:15], 1):
@@ -377,20 +483,22 @@ def display_results_dashboard(rep: dict, results: list[NodeCheckResult]) -> None
         host_str = f"{node['host']}:{node['port']}"
         ping_val = node["latency_ms"]
         ping_color = "bright_green" if ping_val < 60 else "green" if ping_val < 100 else "yellow" if ping_val < 200 else "red"
-        ping_str = f"[bold {ping_color}]{ping_val:.1f} ms[/]"
+        ping_str = f"[bold {ping_color}]{ping_val:.1f}ms[/]"
 
         jit_str = f"[dim]±{node['jitter_ms']:.1f}ms[/]"
         spark_str = f"[{ping_color}]{node['sparkline']}[/]"
         tier_str = f"[bold {ping_color}]{node['tier']}[/]"
 
+        spd = node.get("speed_mbps", 0.0)
         if node.get("http_ok"):
-            http_disp = f"[bold bright_green]✔ {node.get('http_delay_ms', 0):.0f}ms (204)[/]"
+            spd_part = f" [bold cyan]⚡{spd:.1f}Mbps[/]" if spd > 0 else ""
+            http_disp = f"[bold bright_green]✔ {node.get('http_delay_ms', 0):.0f}ms[/]{spd_part}"
         elif node.get("http_probe_msg"):
-            http_disp = f"[dim red]✗ {node.get('http_probe_msg')[:14]}[/]"
+            http_disp = f"[dim red]✗ {node.get('http_probe_msg')[:16]}[/]"
         elif node.get("tls_ok"):
-            http_disp = "[bright_cyan]⚡ TLS Pass[/]"
+            http_disp = f"[bright_cyan]⚡ {node.get('tls_detail') or 'TLS Pass'}[/]"
         else:
-            http_disp = "[dim]--[/]"
+            http_disp = f"[yellow]⚠ {node.get('tls_detail') or 'No TLS'}[/]"
 
         top_table.add_row(
             rank_str,
@@ -425,7 +533,12 @@ def display_results_dashboard(rep: dict, results: list[NodeCheckResult]) -> None
         c_table.add_column("Рейтинг", justify="center", width=14)
 
         for c in rep["top_countries"]:
-            rating = "⭐⭐⭐⭐⭐" if c["avg_latency"] < 70 else "⭐⭐⭐⭐" if c["avg_latency"] < 130 else "⭐⭐⭐" if c["avg_latency"] < 220 else "⭐⭐"
+            rating = (
+                "⭐⭐⭐⭐⭐" if c["avg_latency"] < 70
+                else "⭐⭐⭐⭐" if c["avg_latency"] < 130
+                else "⭐⭐⭐" if c["avg_latency"] < 220
+                else "⭐⭐"
+            )
             c_table.add_row(
                 f"{c['flag']} {c['name']} ({c['code']})",
                 f"[bold cyan]{c['count']}[/] шт.",
@@ -436,15 +549,14 @@ def display_results_dashboard(rep: dict, results: list[NodeCheckResult]) -> None
 
         console.print(c_table)
 
-    # Save fastest results automatically
+    # Save local tested fastest results without overwriting git-tracked mega_sub_fastest.txt
     if alive_nodes:
-        fastest_file = REPO_ROOT / "mega_sub_fastest.txt"
-        top_lines = [r.config.raw_url for r in alive_nodes[:100]]
-        fastest_file.write_text("\n".join(top_lines) + "\n", encoding="utf-8")
+        lat_map = {(r.config.protocol, r.config.host, r.config.port): r.latency_ms for r in alive_nodes}
+        saved_path = _save_local_fastest(alive_nodes, lat_map)
         console.print(
             Panel(
-                f"[bold green]✔ Топ-{min(100, len(alive_nodes))} самых быстрых серверов сохранены в {fastest_file.name}![/]\n"
-                f"[dim]Ссылка подписки: {MEGA_FASTEST_URL}[/]",
+                f"[bold green]✔ Топ-{min(100, len(alive_nodes))} лучших узлов для вашего провайдера сохранены в {saved_path.name} (+ {saved_path.stem}_base64.txt)![/]\n"
+                f"[dim]Подписка GitHub (облако): {MEGA_FASTEST_URL}[/]",
                 border_style="green",
                 box=box.ROUNDED,
             )
@@ -452,16 +564,15 @@ def display_results_dashboard(rep: dict, results: list[NodeCheckResult]) -> None
 
 
 async def run_single_node_diagnostic(target: str) -> None:
-    """Perform a deep step-by-step diagnostic on a single node or config URL."""
+    """Perform a deep 6-stage DPI, HTTP tunnel, bandwidth speed, and exit IP diagnostic."""
     console.print()
     console.print(get_hero_banner())
-    console.print(f"[bold cyan]🔍 ЗАПУСК ГЛУБОКОГО АУДИТА ОБХОДА БЛОКИРОВОК (DPI / ТСПУ)...[/]")
+    console.print("[bold cyan]🔍 ЗАПУСК 6-ЭТАПНОГО АУДИТА ОБХОДА БЛОКИРОВОК (DPI / ТСПУ / SPEEDTEST)...[/]")
 
     cfg = parse_any_proxy_url(target)
     if not cfg:
-        # Check if raw host:port
         if ":" in target and not target.startswith("http"):
-            parts = target.split(":")
+            parts = target.rsplit(":", 1)
             host = parts[0].strip()
             try:
                 port = int(parts[1].strip())
@@ -469,17 +580,22 @@ async def run_single_node_diagnostic(target: str) -> None:
                 console.print(f"[bold red][-] Неверный формат хост:порт: {target}[/]")
                 return
 
-            console.print(f"[*] Базовая проверка TCP порта {host}:{port}...")
+            console.print(f"[*] Проверка TCP порта и TLS ClientHello на {host}:{port}...")
             t0 = time.perf_counter()
             try:
-                _, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port),
-                    timeout=3.0,
-                )
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=3.0)
                 rtt = (time.perf_counter() - t0) * 1000.0
+                writer.write(build_tls_client_hello(host if not host.replace(".", "").isdigit() else ""))
+                await writer.drain()
+                tls_data = b""
+                try:
+                    tls_data = await asyncio.wait_for(reader.read(32), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
                 writer.close()
                 await writer.wait_closed()
-                console.print(f"[bold green][✓] TCP порт {host}:{port} открыт! RTT: {rtt:.1f} ms[/]")
+                tls_note = "TLS ServerHello ✔" if tls_data.startswith(b"\x16\x03") else ("TLS Alert" if tls_data.startswith(b"\x15\x03") else "No TLS response")
+                console.print(f"[bold green][✓] TCP порт {host}:{port} открыт! RTT: {rtt:.1f} ms | {tls_note}[/]")
             except Exception as exc:
                 console.print(f"[bold red][✗] TCP порт {host}:{port} недоступен: {exc}[/]")
             return
@@ -495,11 +611,13 @@ async def run_single_node_diagnostic(target: str) -> None:
     info_table.add_column("Параметр", style="bold cyan", width=22)
     info_table.add_column("Значение", style="white")
 
-    info_table.add_row("Протокол", f"[bold magenta]{cfg.protocol.upper()}[/]")
+    info_table.add_row("Протокол", f"[bold magenta]{cfg.protocol.upper()}[/] (транспорт: {cfg.network_type or 'tcp'})")
     info_table.add_row("Безопасность", f"[bold green]{sec_tag}[/]")
     info_table.add_row("Сервер (Host:Port)", f"{cfg.host}:{cfg.port}")
-    info_table.add_row("Локация", f"{flag} {ru_name} ({code.upper()})")
+    info_table.add_row("Локация (по конфигу)", f"{flag} {ru_name} ({code.upper()})")
     info_table.add_row("SNI / Маскировка", cfg.sni or "(не указан)")
+    if cfg.path or cfg.service_name:
+        info_table.add_row("Path / Service", cfg.service_name or cfg.path)
     info_table.add_row("Fingerprint", cfg.fingerprint or "chrome")
     info_table.add_row("Remark / Имя", cfg.remark or "(пусто)")
     if cfg.public_key:
@@ -508,140 +626,211 @@ async def run_single_node_diagnostic(target: str) -> None:
         info_table.add_row("Reality Short ID", cfg.short_id)
 
     console.print(Panel(info_table, title="[bold cyan]📋 ПАСПОРТ УЗЛА[/]", box=box.ROUNDED))
-
-    # Diagnostic Steps
     console.print("\n[bold yellow]⚡ ТЕСТИРОВАНИЕ ПО ЭТАПАМ:[/]")
 
     # Step 1: DNS
     t_dns0 = time.perf_counter()
-    resolved_ip = ""
     try:
         loop = asyncio.get_running_loop()
         addr_info = await asyncio.wait_for(loop.getaddrinfo(cfg.host, cfg.port), timeout=2.5)
         dns_ms = (time.perf_counter() - t_dns0) * 1000.0
         resolved_ip = addr_info[0][4][0]
-        console.print(f" [bold green][✓] Этап 1:[/] DNS резолв: [bold white]{resolved_ip}[/] за [cyan]{dns_ms:.1f} ms[/] [dim](Чистый IP)[/]")
+        console.print(f" [bold green][✓] Этап 1:[/] DNS резолв: [bold white]{resolved_ip}[/] за [cyan]{dns_ms:.1f} ms[/]")
     except Exception as exc:
         console.print(f" [bold red][✗] Этап 1:[/] Ошибка DNS резолва: {exc}")
         return
 
-    # Step 2: Multi-Sample TCP RTT
-    pings: list[float] = []
-    for i in range(1, 4):
-        try:
-            t0 = time.perf_counter()
-            _, w = await asyncio.wait_for(asyncio.open_connection(cfg.host, cfg.port), timeout=2.5)
-            rtt = (time.perf_counter() - t0) * 1000.0
-            pings.append(rtt)
-            w.close()
-            await w.wait_closed()
-            await asyncio.sleep(0.05)
-        except Exception as exc:
-            console.print(f" [bold red][✗] Этап 2:[/] Сбой TCP подключения (замер #{i}): {exc}")
-            return
-
-    min_p = min(pings)
-    avg_p = sum(pings) / len(pings)
-    jitter = max(pings) - min(pings)
-    spark = make_sparkline(pings)
-    p_details = ", ".join(f"{p:.1f}ms" for p in pings)
-    console.print(
-        f" [bold green][✓] Этап 2:[/] TCP Handshake RTT: [bold green]{min_p:.1f} ms[/] "
-        f"[dim](замеры: {p_details})[/] • Джиттер: [bold yellow]±{jitter:.1f} ms[/] [{spark}]"
-    )
-
-    # Step 3: Zombie & Instant EOF Detection
-    try:
-        r, w = await asyncio.wait_for(asyncio.open_connection(cfg.host, cfg.port), timeout=2.5)
-        try:
-            await asyncio.wait_for(r.read(1), timeout=0.05)
-        except asyncio.TimeoutError:
-            pass
-        if r.at_eof():
-            console.print(" [bold red][✗] Этап 3:[/] [bold red]ЗОМБИ-СОКЕТ![/] Сервер сразу закрыл соединение (EOF).")
-            w.close()
-            return
-        w.close()
-        await w.wait_closed()
-        console.print(" [bold green][✓] Этап 3:[/] Проверка сокета: [bold green]Чисто[/] (Сервер удерживает сессию, не сбрасывает)")
-    except Exception as exc:
-        console.print(f" [bold red][✗] Этап 3:[/] Ошибка проверки сокета: {exc}")
-        return
-
-    # Step 4: TLS / SNI Reachability (DPI bypass)
-    target_sni = cfg.sni or cfg.host
-    console.print(f" [bold yellow][~] Этап 4:[/] Проверка маскировки TLS / SNI ([cyan]{target_sni}[/])...")
-    res = await check_node_advanced(cfg, timeout=3.0, samples_count=2)
-
-    if not (res.alive and res.tls_ok):
-        console.print(f" [bold red][✗] Этап 4:[/] TLS / DPI Рукопожатие отклонено: {res.error_msg or 'Сброс соединения ТСПУ'}")
+    # Step 2: Multi-Sample TCP RTT (skipped for UDP Hysteria2)
+    res = await check_node_advanced(cfg, timeout=3.0, samples_count=3)
+    if not res.alive:
+        console.print(f" [bold red][✗] Этап 2:[/] Сбой подключения: {res.error_msg}")
         console.print(
             Panel(
-                Align.center(Text("💀 СЕРВЕР НЕ РАБОТАЕТ ИЛИ ЗАБЛОКИРОВАН РКН (ТСПУ / RST Drop)", style="bold red")),
+                Align.center(Text("💀 СЕРВЕР НЕДОСТУПЕН ПО СЕТИ (Timeout / RST / DNS)", style="bold red")),
                 border_style="red",
                 box=box.ROUNDED,
             )
         )
         return
 
-    console.print(f" [bold green][✓] Этап 4:[/] TLS / DPI Рукопожатие: [bold green]УСПЕШНО[/] (ТСПУ не вмешивается в TLS)")
+    if cfg.protocol != "hysteria2":
+        p_details = ", ".join(f"{p:.1f}ms" for p in res.samples)
+        console.print(
+            f" [bold green][✓] Этап 2:[/] TCP RTT: [bold green]{res.latency_ms:.1f} ms[/] "
+            f"[dim](замеры: {p_details})[/] • Джиттер: [bold yellow]±{res.jitter_ms:.1f} ms[/] [{res.sparkline}]"
+        )
+    else:
+        console.print(f" [bold green][✓] Этап 2:[/] UDP/QUIC порт доступен (~{res.latency_ms:.0f} ms)")
 
-    # Step 5: Real HTTP Proxy Delay Probe (End-to-End tunnel data transfer)
-    console.print(f" [bold yellow][~] Этап 5:[/] Тест сквозного HTTP туннеля через прокси (Cloudflare 204)...")
-    http_ok, http_delay, http_msg = await probe_proxy_http(cfg, timeout=4.0)
+    # Step 3: TLS 1.3 ClientHello SNI Check (non-fatal warning if failed, Step 4 decides)
+    target_sni = cfg.sni or cfg.host
+    if res.tls_ok:
+        console.print(
+            f" [bold green][✓] Этап 3:[/] TLS 1.3 SNI ([cyan]{target_sni}[/]): [bold green]{res.tls_detail or 'OK'}[/]"
+        )
+    else:
+        console.print(
+            f" [bold yellow][!] Этап 3:[/] TLS 1.3 ClientHello ([cyan]{target_sni}[/]): "
+            f"[yellow]{res.tls_detail or 'Нет ответа'}[/] [dim](продолжаем через реальное VPN ядро...)[/]"
+        )
+
+    # Step 4: Real HTTP Proxy Delay Probe (Dual-Core: sing-box / Xray)
+    console.print(" [bold yellow][~] Этап 4:[/] Тест сквозного HTTP туннеля (Cloudflare 204)...")
+    http_ok, http_delay, http_msg = await probe_proxy_http(cfg, timeout=5.0)
 
     if http_ok:
         console.print(
-            f" [bold green][✓] Этап 5:[/] Real HTTP Proxy Tunnel: [bold bright_green]204 OK ({http_delay:.0f}ms)[/] "
+            f" [bold green][✓] Этап 4:[/] Real HTTP Tunnel: [bold bright_green]{http_msg}[/] "
             f"[dim](Реальная передача трафика сквозь прокси подтверждена!)[/]"
         )
-        console.print(f" [bold green][✓] Этап 6:[/] Вердикт РКН: [bold green]ПОЛНЫЙ ОБХОД ТСПУ И ПЕРЕДАЧА ДАННЫХ ПОДТВЕРЖДЕНЫ НА 100%![/]")
 
-        # Final Verdict Box
+        # Step 5: Real Bandwidth Speedtest & Exit IP
+        console.print(" [bold yellow][~] Этап 5:[/] Замер пропускной способности и проверка выходного IP...")
+        sp_ok, mbps, b_read, dt_s, sp_msg = await measure_node_speed(cfg, byte_limit=524288, timeout=6.0)
+        ip_ok, exit_ip, exit_country, exit_isp = await probe_proxy_exit_ip(cfg, timeout=4.0)
+
+        if sp_ok:
+            console.print(
+                f" [bold green][✓] Этап 5a:[/] Скорость загрузки: [bold bright_cyan]{mbps:.2f} Mbps[/] "
+                f"[dim]({b_read // 1024} KB за {dt_s:.2f}s)[/]"
+            )
+        else:
+            console.print(f" [bold yellow][!] Этап 5a:[/] Замер скорости не удался ({sp_msg})")
+
+        if ip_ok:
+            console.print(
+                f" [bold green][✓] Этап 5b:[/] Выходной IP: [bold white]{exit_ip}[/] • "
+                f"Локация: {exit_country} • Провайдер: [cyan]{exit_isp or 'N/A'}[/]"
+            )
+        else:
+            console.print(" [dim] [~] Этап 5b: Выходной IP не определен[/]")
+
+        console.print(" [bold green][✓] Этап 6:[/] Вердикт РКН: [bold green]ПОЛНЫЙ ОБХОД ТСПУ ПОДТВЕРЖДЕН НА 100%![/]")
+
         verdict = Text()
         verdict.append("🟢 СЕРВЕР ПОЛНОСТЬЮ РАБОТАЕТ И ГОДЕН К ИСПОЛЬЗОВАНИЮ В РФ!\n", style="bold green")
+        spd_txt = f"  •  Скорость: {mbps:.1f} Mbps" if sp_ok else ""
         verdict.append(
-            f"Категория: {res.quality_tier}  •  TCP RTT: {res.latency_ms:.1f} ms  •  HTTP Задержка: {http_delay:.0f} ms  •  Джиттер: ±{res.jitter_ms:.1f} ms\n",
+            f"Категория: {res.quality_tier}  •  TCP RTT: {res.latency_ms:.1f}ms  •  "
+            f"HTTP: {http_delay:.0f}ms{spd_txt}  •  Джиттер: ±{res.jitter_ms:.1f}ms\n",
             style="bold white",
         )
+        if ip_ok:
+            verdict.append(f"Выход: {exit_country} ({exit_ip})\n", style="cyan")
         verdict.append("Годен для: YouTube 4K, Discord, Instagram, Telegram без тормозов", style="dim green")
 
         console.print(Panel(Align.center(verdict), border_style="green", box=box.ROUNDED))
     else:
         console.print(
-            f" [bold red][✗] Этап 5:[/] Real HTTP Proxy Tunnel: [bold red]СБОЙ ({http_msg})[/] "
-            f"[dim](ТСПУ блокирует данные или невалидные ключи Reality)[/]"
+            f" [bold red][✗] Этап 4:[/] Real HTTP Tunnel: [bold red]СБОЙ ({http_msg})[/] "
+            f"[dim](ТСПУ блокирует туннель, истекли ключи или неверный UUID)[/]"
         )
-        console.print(f" [bold yellow][!] Этап 6:[/] Вердикт РКН: [bold yellow]ЧАСТИЧНЫЙ ДОСТУП — ТСПУ БЛОКИРУЕТ ДАННЫЕ ИЛИ КЛЮЧИ НЕВАЛИДНЫ[/]")
+        console.print(" [bold yellow][!] Этап 6:[/] Вердикт: [bold yellow]ПОРТ ОТКРЫТ, НО ТУННЕЛЬ НЕ ПЕРЕДАЕТ ДАННЫЕ[/]")
 
         verdict = Text()
-        verdict.append("⚠️ СЕРВЕР ДОСТУПЕН ПО TCP/TLS, НО ПЕРЕДАЧА ДАННЫХ НЕ РАБОТАЕТ!\n", style="bold yellow")
-        verdict.append(f"Ошибка HTTP туннеля: {http_msg}  •  TCP RTT: {res.latency_ms:.1f} ms", style="dim yellow")
+        verdict.append("⚠️ СЕРВЕР ОТВЕЧАЕТ НА ПОРТУ, НО ПРОКСИ-ТУННЕЛЬ НЕ РАБОТАЕТ!\n", style="bold yellow")
+        verdict.append(f"Причина: {http_msg}  •  TCP RTT: {res.latency_ms:.1f} ms", style="dim yellow")
         console.print(Panel(Align.center(verdict), border_style="yellow", box=box.ROUNDED))
 
-    # Copy option
-    console.print("\n[bold cyan][1][/] Скопировать конфигурацию в буфер обмена")
-    console.print("[bold cyan][0][/] Выход")
-    try:
-        ans = console.input("[bold yellow]Выберите действие [1/0]: [/]").strip()
-        if ans == "1":
-            if copy_to_clipboard(cfg.raw_url):
-                console.print("[bold green]✔ Конфиг успешно скопирован в буфер обмена Windows![/]")
-            else:
-                console.print("[bold yellow]Ссылка на конфиг:[/]\n" + cfg.raw_url)
-    except (KeyboardInterrupt, EOFError):
-        pass
+    if sys.stdin.isatty():
+        console.print("\n[bold cyan][1][/] Скопировать конфигурацию в буфер обмена")
+        console.print("[bold cyan][0][/] Выход")
+        try:
+            ans = console.input("[bold yellow]Выберите действие [1/0]: [/]").strip()
+            if ans == "1":
+                if copy_to_clipboard(cfg.raw_url):
+                    console.print("[bold green]✔ Конфиг успешно скопирован в буфер обмена![/]")
+                else:
+                    console.print("[bold yellow]Ссылка на конфиг:[/]\n" + cfg.raw_url)
+        except (KeyboardInterrupt, EOFError):
+            pass
+
+
+async def _run_batch_http_with_progress(
+    results: list[NodeCheckResult],
+    top_n: int = 50,
+) -> list[NodeCheckResult]:
+    alive_count = sum(1 for r in results if r.alive)
+    if alive_count == 0:
+        return results
+    candidates = min(top_n, alive_count)
+    console.print(f"\n[bold yellow]⚡ Запуск Dual-Core Deep HTTP Probe по {candidates} разнообразным узлам...[/]")
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+    ) as prog:
+        task_id = prog.add_task("[bold cyan]Deep HTTP Probe (sing-box + Xray)...", total=candidates)
+        results = await probe_nodes_http_batch(
+            results,
+            top_n=candidates,
+            concurrency=24,
+            progress_cb=lambda done, total, res: prog.update(task_id, completed=done),
+        )
+    return results
+
+
+async def _run_top_speedtest(results: list[NodeCheckResult], count: int = 3) -> None:
+    targets = [r for r in results if r.alive and r.http_ok][:count]
+    if not targets:
+        # Avoid speedtesting nodes already proven to fail HTTP 204 transit
+        unprobed = [r for r in results if r.alive and not r.http_probe_msg]
+        if unprobed:
+            probed = await _run_batch_http_with_progress(unprobed, top_n=min(12, len(unprobed)))
+            targets = [r for r in probed if r.alive and r.http_ok][:count]
+    if not targets:
+        console.print("[bold yellow]Нет HTTP-подтвержденных узлов для замера скорости (пропускаем Speedtest).[/]")
+        return
+
+    console.print(f"\n[bold cyan]🚀 Замер реальной пропускной способности (Speedtest) на Топ-{len(targets)} узлах...[/]")
+    for idx, r in enumerate(targets, 1):
+        ok, mbps, b_read, dt_s, detail = await measure_node_speed(r.config, byte_limit=524288, timeout=6.0)
+        if ok:
+            r.speed_mbps = mbps
+            console.print(
+                f"  [{idx}] {r.country_flag} {r.config.host}:{r.config.port} -> "
+                f"[bold bright_green]{mbps:.2f} Mbps[/] ({b_read // 1024} KB / {dt_s:.2f}s)"
+            )
+        else:
+            console.print(f"  [{idx}] {r.country_flag} {r.config.host}:{r.config.port} -> [dim red]{detail}[/]")
+
+
+async def _run_top_exit_ip(results: list[NodeCheckResult], count: int = 3) -> None:
+    targets = [r for r in results if r.alive and r.http_ok][:count]
+    if not targets:
+        targets = [r for r in results if r.alive][:count]
+    if not targets:
+        console.print("[bold red]Нет живых узлов для проверки Exit IP.[/]")
+        return
+
+    console.print(f"\n[bold cyan]🌐 Проверка реального выходного IP и провайдера на Топ-{len(targets)} узлах...[/]")
+    for idx, r in enumerate(targets, 1):
+        ip_ok, exit_ip, exit_country, exit_isp = await probe_proxy_exit_ip(r.config, timeout=5.0)
+        if ip_ok:
+            console.print(
+                f"  [{idx}] {r.config.host}:{r.config.port} -> [bold white]{exit_ip}[/] • "
+                f"{exit_country} • [cyan]{exit_isp or 'N/A'}[/]"
+            )
+        else:
+            console.print(f"  [{idx}] {r.config.host}:{r.config.port} -> [dim red]{exit_isp}[/]")
 
 
 async def execute_benchmark_interactive(
     limit: int = 100,
     deep_http: bool = False,
     interactive: bool = True,
+    source: str = "mega",
+    country: str = "",
+    proto: str = "",
+    deep_limit: int = 50,
+    speedtest: bool = False,
 ) -> list[NodeCheckResult]:
-    """Run full benchmark session with animated Live UI and optional Deep HTTP Tunnel verification."""
-    sub_file = REPO_ROOT / MEGA_SUBSCRIPTION_OUTPUT
+    """Run full benchmark session with throttled Rich Live UI, GeoIP, Dual-Core HTTP Probe, and Speedtest."""
+    sub_file = _resolve_source_file(source)
     if not sub_file.exists():
-        console.print(f"[bold red][-] Файл {MEGA_SUBSCRIPTION_OUTPUT} не найден. Сначала выполните обновление подписок.[/]")
+        console.print(f"[bold red][-] Файл {sub_file.name} не найден. Сначала выполните обновление подписок.[/]")
         return []
 
     lines = sub_file.read_text(encoding="utf-8").splitlines()
@@ -650,57 +839,47 @@ async def execute_benchmark_interactive(
         p = parse_any_proxy_url(line)
         if p:
             configs.append(p)
-            if limit and len(configs) >= limit:
-                break
+
+    configs = _filter_configs(configs, country=country, proto=proto)
+    if limit and limit > 0:
+        configs = configs[:limit]
 
     if not configs:
-        console.print("[bold red][-] Нет доступных конфигураций для тестирования.[/]")
+        console.print("[bold red][-] Нет конфигураций, подходящих под выбранные фильтры.[/]")
         return []
 
-    session = BenchmarkSessionUI(configs, concurrency=48)
+    session = BenchmarkSessionUI(configs, concurrency=48, label=sub_file.name)
+    last_render = 0.0
 
-    with Live(session.make_live_renderable(), console=console, refresh_per_second=10) as live:
+    with Live(session.make_live_renderable(), console=console, refresh_per_second=8) as live:
+        def on_done(done: int, total: int, res: NodeCheckResult) -> None:
+            nonlocal last_render
+            session.on_node_done(done, total, res)
+            now = time.monotonic()
+            if done == total or (now - last_render) >= 0.12:
+                last_render = now
+                live.update(session.make_live_renderable())
+
         results = await benchmark_nodes(
             configs,
             concurrency=48,
-            progress_callback=lambda done, total, res: (
-                session.on_node_done(done, total, res),
-                live.update(session.make_live_renderable()),
-            ),
+            progress_callback=on_done,
         )
 
-    # Optional Deep HTTP Proxy Probe
-    alive_count = len([r for r in results if r.alive])
-    if deep_http and alive_count > 0:
-        console.print("\n[bold yellow]⚡ Запуск сквозного HTTP-теста передачи данных через лучшие прокси...[/]")
-        top_candidates = min(15, alive_count)
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            console=console,
-        ) as prog:
-            task_id = prog.add_task("[bold cyan]Deep HTTP Probe...", total=top_candidates)
-            results = await probe_nodes_http_batch(
-                results,
-                top_n=top_candidates,
-                concurrency=4,
-                progress_cb=lambda done, total, res: prog.update(task_id, completed=done),
-            )
+    # Enrich unknown country flags via fast batch GeoIP
+    await asyncio.to_thread(enrich_results_geoip, results, 2.0)
 
-    # Generate Statistical Report
+    # Optional Dual-Core Deep HTTP Proxy Probe
+    if deep_http and any(r.alive for r in results):
+        results = await _run_batch_http_with_progress(results, top_n=deep_limit)
+
+    # Optional Speedtest on top nodes
+    if speedtest and any(r.alive for r in results):
+        await _run_top_speedtest(results, count=3)
+
     rep = build_health_report(results)
-    display_results_dashboard(rep, results)
+    display_results_dashboard(rep, results, source_label=sub_file.name)
 
-    # Auto-export fastest results
-    alive_nodes = [r for r in results if r.alive]
-    if alive_nodes:
-        fastest_file = REPO_ROOT / "mega_sub_fastest.txt"
-        top_lines = [r.config.raw_url for r in alive_nodes[:100]]
-        fastest_file.write_text("\n".join(top_lines) + "\n", encoding="utf-8")
-
-    # If non-interactive mode or non-TTY, exit cleanly without blocking
     if not interactive or not sys.stdin.isatty():
         return results
 
@@ -709,15 +888,18 @@ async def execute_benchmark_interactive(
         alive_nodes = [r for r in results if r.alive]
         console.print("\n[bold cyan]⚡ ДОПОЛНИТЕЛЬНЫЕ ДЕЙСТВИЯ:[/]")
         console.print(" [1] 📋 Скопировать [bold gold1]#1 самый быстрый узел[/] в буфер обмена")
-        console.print(" [2] 🎯 Проверить реальный интернет (Deep HTTP Probe ТОП-15 узлов)")
-        console.print(" [3] 💾 Экспортировать Топ-100 в mega_sub_fastest.txt")
-        console.print(" [4] 📄 Сохранить подробный JSON отчет (audit_report.json)")
-        console.print(" [5] 🔬 Провести детальную DPI диагностику узла")
-        console.print(" [6] 📋 Скопировать ссылку на универсальную подписку")
+        console.print(" [2] 📦 Скопировать [bold cyan]ТОП-5 лучших узлов[/] одним списком")
+        console.print(" [3] 🎯 Проверить реальный интернет (Dual-Core Deep HTTP Probe по 50 узлам)")
+        console.print(" [4] ⚡ Замерить реальную скорость (Speedtest Mbps) на ТОП-3 узлах")
+        console.print(" [5] 🔬 Детальная DPI/Speed диагностика узла (по номеру из таблицы)")
+        console.print(" [6] 💾 Обновить mega_sub_fastest.txt (с заголовками подписки)")
+        console.print(" [7] 📄 Сохранить подробный JSON отчет (audit_report.json)")
+        console.print(" [8] 📋 Скопировать ссылку на универсальную подписку")
+        console.print(" [9] 🌐 Проверить реальный Exit IP и провайдера на ТОП-3 узлах")
         console.print(" [0] 🚪 Вернуться / Выход")
 
         try:
-            choice = console.input("[bold yellow]Выберите пункт [0-6]: [/]").strip()
+            choice = console.input("[bold yellow]Выберите пункт [0-9]: [/]").strip()
         except (KeyboardInterrupt, EOFError):
             break
 
@@ -725,51 +907,70 @@ async def execute_benchmark_interactive(
             if alive_nodes:
                 best_url = alive_nodes[0].config.raw_url
                 if copy_to_clipboard(best_url):
-                    console.print(f"[bold green]✔ Самый быстрый сервер ({alive_nodes[0].latency_ms}ms) скопирован в буфер обмена![/]")
+                    console.print(f"[bold green]✔ #1 узел ({alive_nodes[0].latency_ms}ms) скопирован в буфер обмена![/]")
                 else:
                     console.print(f"[bold yellow]Ссылка:\n{best_url}[/]")
             else:
                 console.print("[bold red]Нет живых узлов для копирования.[/]")
         elif choice == "2":
             if alive_nodes:
-                console.print("\n[bold yellow]⚡ Запуск Deep HTTP Probe на ТОП-15 узлах...[/]")
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    BarColumn(),
-                    TextColumn("{task.completed}/{task.total}"),
-                    console=console,
-                ) as prog:
-                    task_id = prog.add_task("[bold cyan]Deep HTTP Probe...", total=min(15, len(alive_nodes)))
-                    results = await probe_nodes_http_batch(
-                        results,
-                        top_n=15,
-                        concurrency=4,
-                        progress_cb=lambda done, total, res: prog.update(task_id, completed=done),
-                    )
-                rep = build_health_report(results)
-                display_results_dashboard(rep, results)
-                console.print("[bold green]✔ Проверка завершена! 100% рабочие узлы подняты в топ рейтинга![/]")
+                bundle = "\n".join(r.config.raw_url for r in alive_nodes[:5])
+                if copy_to_clipboard(bundle):
+                    console.print(f"[bold green]✔ ТОП-{min(5, len(alive_nodes))} лучших узлов скопированы в буфер обмена![/]")
+                else:
+                    console.print(bundle)
             else:
-                console.print("[bold red]Нет живых узлов для тестирования.[/]")
+                console.print("[bold red]Нет живых узлов.[/]")
         elif choice == "3":
             if alive_nodes:
-                fastest_file = REPO_ROOT / "mega_sub_fastest.txt"
-                top_lines = [r.config.raw_url for r in alive_nodes[:100]]
-                fastest_file.write_text("\n".join(top_lines) + "\n", encoding="utf-8")
-                console.print(f"[bold green]✔ Топ-{len(top_lines)} сохранен в {fastest_file.name}![/]")
+                results = await _run_batch_http_with_progress(results, top_n=50)
+                rep = build_health_report(results)
+                display_results_dashboard(rep, results, source_label=sub_file.name)
+                console.print("[bold green]✔ Проверка завершена! HTTP-подтвержденные узлы подняты в топ![/]")
+            else:
+                console.print("[bold red]Нет живых узлов для тестирования.[/]")
         elif choice == "4":
+            if alive_nodes:
+                await _run_top_speedtest(results, count=3)
+                rep = build_health_report(results)
+                display_results_dashboard(rep, results, source_label=sub_file.name)
+            else:
+                console.print("[bold red]Нет живых узлов.[/]")
+        elif choice == "5":
+            if alive_nodes:
+                raw_idx = console.input(
+                    f"[bold cyan]Введите номер узла из ТОП-{min(15, len(alive_nodes))} [Enter для #1]: [/]"
+                ).strip()
+                idx = 1
+                if raw_idx.isdigit():
+                    idx = max(1, min(len(alive_nodes), int(raw_idx)))
+                await run_single_node_diagnostic(alive_nodes[idx - 1].config.raw_url)
+            else:
+                console.print("[bold red]Нет живых узлов для анализа.[/]")
+        elif choice == "6":
+            if alive_nodes:
+                lat_map = {(r.config.protocol, r.config.host, r.config.port): r.latency_ms for r in alive_nodes}
+                top_urls = normalize_urls([r.config for r in alive_nodes[:100]], lat_map)
+                fastest_path = REPO_ROOT / MEGA_FASTEST_OUTPUT
+                write_output_file(top_urls, fastest_path, "Nota Vless Fastest Top 100")
+                write_base64_file(top_urls, REPO_ROOT / "mega_sub_fastest_base64.txt")
+                console.print(f"[bold green]✔ Топ-{len(top_urls)} сохранен в {fastest_path.name} и Base64![/]")
+        elif choice == "7":
             json_file = REPO_ROOT / "audit_report.json"
             export_data = {
                 "timestamp": datetime.now().isoformat(),
+                "source": sub_file.name,
                 "summary": rep,
                 "all_nodes": [
                     {
                         "host": r.config.host,
                         "port": r.config.port,
                         "protocol": r.config.protocol,
+                        "network": r.config.network_type,
                         "security": r.security_tag,
                         "alive": r.alive,
+                        "tls_ok": r.tls_ok,
+                        "tls_detail": r.tls_detail,
                         "latency_ms": r.latency_ms,
                         "jitter_ms": r.jitter_ms,
                         "country": r.country_name,
@@ -777,6 +978,7 @@ async def execute_benchmark_interactive(
                         "tier": r.quality_tier,
                         "http_ok": r.http_ok,
                         "http_delay_ms": r.http_delay_ms,
+                        "speed_mbps": r.speed_mbps,
                         "raw_url": r.config.raw_url,
                     }
                     for r in results
@@ -784,16 +986,16 @@ async def execute_benchmark_interactive(
             }
             json_file.write_text(json.dumps(export_data, ensure_ascii=False, indent=2), encoding="utf-8")
             console.print(f"[bold green]✔ Отчет успешно экспортирован в {json_file.name}![/]")
-        elif choice == "5":
-            if alive_nodes:
-                await run_single_node_diagnostic(alive_nodes[0].config.raw_url)
-            else:
-                console.print("[bold red]Нет живых узлов для анализа.[/]")
-        elif choice == "6":
+        elif choice == "8":
             if copy_to_clipboard(MEGA_SUBSCRIPTION_URL):
                 console.print(f"[bold green]✔ Ссылка подписки скопирована: {MEGA_SUBSCRIPTION_URL}[/]")
             else:
                 console.print(f"Ссылка: {MEGA_SUBSCRIPTION_URL}")
+        elif choice == "9":
+            if alive_nodes:
+                await _run_top_exit_ip(results, count=3)
+            else:
+                console.print("[bold red]Нет живых узлов для проверки.[/]")
         elif choice in ("0", "q", "exit"):
             break
 
@@ -807,11 +1009,13 @@ def main_interactive_menu() -> None:
         console.print(get_hero_banner())
 
         menu_panel = Panel(
-            """ [bold cyan][1][/] ⚡ [bold white]Экспресс-аудит[/] [dim](Топ-30 серверов — молниеносный тест за 3-5 сек)[/]
- [bold green][2][/] 🚀 [bold white]Стандартный бенчмарк[/] [dim](Топ-100 серверов — идеальный баланс)[/]
+            """ [bold cyan][1][/] ⚡ [bold white]Экспресс-аудит[/] [dim](Топ-30 серверов из mega_sub — 2-3 сек)[/]
+ [bold green][2][/] 🚀 [bold white]Стандартный бенчмарк[/] [dim](Топ-100 серверов из mega_sub)[/]
  [bold magenta][3][/] 🌌 [bold white]Глубокий аудит всей базы[/] [dim](Все серверы из mega_sub.txt)[/]
- [bold bright_green][4][/] 🎯 [bold white]Экспресс-тест + Deep HTTP Probe[/] [dim](Топ-30 с реальной проверкой веб-трафика)[/]
- [bold yellow][5][/] 🔬 [bold white]DPI Диагностика конкретного узла[/] [dim](Вставить ссылку vless/trojan/hy2)[/]
+ [bold bright_green][4][/] 🎯 [bold white]Умный Deep HTTP Audit[/] [dim](Dual-Core sing-box + Xray реальный HTTP 204 до 50 узлов!)[/]
+ [bold yellow][5][/] 🔬 [bold white]DPI + Speedtest + Exit IP одного узла[/] [dim](vless/trojan/hy2 или host:port)[/]
+ [bold blue][6][/] 📱 [bold white]Тест LTE / Whitelist подписок + HTTP Probe[/] [dim](vless_lte.txt для мобильной связи)[/]
+ [bold white][7][/] 🌍 [bold white]Фильтр по файлу / стране / протоколу[/] [dim](de/nl/fi/ru, reality/trojan/hy2/xhttp)[/]
  [bold red][0][/] 🚪 [bold white]Выход[/]""",
             title="[bold bright_white]ГЛАВНОЕ МЕНЮ ТЕСТЕРА[/]",
             border_style="bright_cyan",
@@ -821,7 +1025,7 @@ def main_interactive_menu() -> None:
         console.print(menu_panel)
 
         try:
-            choice = console.input("[bold yellow]Выберите режим [0-5]: [/]").strip()
+            choice = console.input("[bold yellow]Выберите режим [0-7]: [/]").strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\nВыход.")
             break
@@ -836,13 +1040,36 @@ def main_interactive_menu() -> None:
             asyncio.run(execute_benchmark_interactive(limit=0, deep_http=False))
             console.input("\n[dim]Нажмите Enter для продолжения...[/]")
         elif choice == "4":
-            asyncio.run(execute_benchmark_interactive(limit=30, deep_http=True))
+            asyncio.run(execute_benchmark_interactive(limit=0, deep_http=True, deep_limit=50))
             console.input("\n[dim]Нажмите Enter для продолжения...[/]")
         elif choice == "5":
             try:
                 target = console.input("[bold cyan]Введите ссылку vless/trojan/hy2 или host:port: [/]").strip()
                 if target:
                     asyncio.run(run_single_node_diagnostic(target))
+            except (KeyboardInterrupt, EOFError):
+                pass
+            console.input("\n[dim]Нажмите Enter для продолжения...[/]")
+        elif choice == "6":
+            asyncio.run(execute_benchmark_interactive(limit=0, deep_http=True, deep_limit=40, source="lte"))
+            console.input("\n[dim]Нажмите Enter для продолжения...[/]")
+        elif choice == "7":
+            try:
+                src = console.input("[bold cyan]Источник (mega/fastest/lte/wifi/trojan/hy2) [mega]: [/]").strip() or "mega"
+                cntry = console.input("[bold cyan]Фильтр страны (например de, nl, fi, ru, пусто=все): [/]").strip()
+                pr = console.input("[bold cyan]Фильтр протокола (reality/vless/trojan/hy2/ws/xhttp, пусто=все): [/]").strip()
+                deep_ans = console.input("[bold cyan]Запустить Deep HTTP Probe? [Y/n]: [/]").strip().lower()
+                use_deep = deep_ans not in ("n", "no", "н", "нет")
+                asyncio.run(
+                    execute_benchmark_interactive(
+                        limit=0,
+                        deep_http=use_deep,
+                        deep_limit=40,
+                        source=src,
+                        country=cntry,
+                        proto=pr,
+                    )
+                )
             except (KeyboardInterrupt, EOFError):
                 pass
             console.input("\n[dim]Нажмите Enter для продолжения...[/]")
@@ -855,16 +1082,32 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Nota Vless Ultimate Speed Tester")
     parser.add_argument("target", nargs="?", default="", help="Single node URL or host:port to test")
     parser.add_argument("--limit", type=int, default=0, help="Max nodes to test in benchmark")
-    parser.add_argument("--all", action="store_true", help="Test all nodes from mega_sub.txt")
+    parser.add_argument("--all", action="store_true", help="Test all nodes from selected subscription")
     parser.add_argument("--deep", "--http-probe", action="store_true", help="Run Deep HTTP delay probe on top nodes")
+    parser.add_argument("--deep-limit", type=int, default=50, help="Max nodes to verify in Deep HTTP Probe")
+    parser.add_argument("--speedtest", action="store_true", help="Also run Mbps speedtest on top verified nodes")
+    parser.add_argument("--source", default="mega", help="Subscription source (mega/fastest/lte/wifi/trojan/hy2/local or file path)")
+    parser.add_argument("--country", default="", help="Filter nodes by country code or name (e.g. de, nl, fi, ru)")
+    parser.add_argument("--proto", default="", help="Filter nodes by protocol/transport (e.g. reality, vless, trojan, hy2, ws, xhttp)")
     parser.add_argument("--non-interactive", "-y", action="store_true", help="Run in non-interactive batch mode (no prompts)")
     args = parser.parse_args()
 
     if args.target:
         asyncio.run(run_single_node_diagnostic(args.target))
-    elif args.all or args.limit:
+    elif args.all or args.limit or args.deep or args.country or args.proto or args.source != "mega":
         lim = 0 if args.all else args.limit
         is_inter = not args.non_interactive and sys.stdin.isatty()
-        asyncio.run(execute_benchmark_interactive(limit=lim, deep_http=args.deep, interactive=is_inter))
+        asyncio.run(
+            execute_benchmark_interactive(
+                limit=lim,
+                deep_http=args.deep,
+                interactive=is_inter,
+                source=args.source,
+                country=args.country,
+                proto=args.proto,
+                deep_limit=args.deep_limit,
+                speedtest=args.speedtest,
+            )
+        )
     else:
         main_interactive_menu()

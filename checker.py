@@ -1,13 +1,16 @@
 """
 Advanced Multi-Protocol Proxy Health Checker & Latency Benchmark Engine.
-Measures true RTT latency, multi-sample jitter, TLS/SNI handshake validity,
-anti-censorship (TSPU / DPI) liveness, GeoIP country flags, and sorts nodes.
+Measures true RTT latency, multi-sample jitter, real TLS/SNI ClientHello handshake
+validity, anti-censorship (TSPU / DPI) liveness, GeoIP country flags, dual-core
+(sing-box + Xray) real HTTP tunnel delay & throughput, and sorts nodes.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -18,7 +21,9 @@ import struct
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
@@ -82,6 +87,17 @@ COUNTRY_RU_NAMES: dict[str, str] = {
     "hn": "Гондурас",
     "ir": "Иран",
     "au": "Австралия",
+    "az": "Азербайджан",
+    "uz": "Узбекистан",
+    "th": "Таиланд",
+    "vn": "Вьетнам",
+    "id": "Индонезия",
+    "tw": "Тайвань",
+    "ar": "Аргентина",
+    "mx": "Мексика",
+    "cl": "Чили",
+    "co": "Колумбия",
+    "za": "ЮАР",
     "eu": "Европа",
     "xx": "Сервер",
 }
@@ -98,7 +114,10 @@ FLAG_MAP: dict[str, str] = {
     "cy": "🇨🇾", "ae": "🇦🇪", "in": "🇮🇳", "kr": "🇰🇷", "br": "🇧🇷",
     "il": "🇮🇱", "gr": "🇬🇷", "hu": "🇭🇺", "ie": "🇮🇪", "is": "🇮🇸",
     "pt": "🇵🇹", "lu": "🇱🇺", "be": "🇧🇪", "sk": "🇸🇰", "si": "🇸🇮",
-    "hr": "🇭🇷", "hn": "🇭🇳", "ir": "🇮🇷", "au": "🇦🇺", "eu": "🇪🇺",
+    "hr": "🇭🇷", "hn": "🇭🇳", "ir": "🇮🇷", "au": "🇦🇺", "az": "🇦🇿",
+    "uz": "🇺🇿", "th": "🇹🇭", "vn": "🇻🇳", "id": "🇮🇩", "tw": "🇹🇼",
+    "ar": "🇦🇷", "mx": "🇲🇽", "cl": "🇨🇱", "co": "🇨🇴", "za": "🇿🇦",
+    "eu": "🇪🇺",
 }
 
 COUNTRY_KEYWORDS: dict[str, list[str]] = {
@@ -106,11 +125,11 @@ COUNTRY_KEYWORDS: dict[str, list[str]] = {
     "nl": ["netherlands", "holland", "amsterdam", "rotterdam", "nl"],
     "fi": ["finland", "helsinki", "fi"],
     "ru": ["russia", "russian", "moscow", "spb", "surgut", "piter", "ru"],
-    "us": ["usa", "united states", "america", "virginia", "california", "new york", "miami", "chicago", "los angeles", "dallas", "seattle", "us"],
-    "fr": ["france", "paris", "marseille", "strasbourg", "gravelines", "fr"],
+    "us": ["usa", "united states", "america", "virginia", "california", "new york", "miami", "chicago", "los angeles", "dallas", "seattle", "ashburn", "us"],
+    "fr": ["france", "paris", "marseille", "strasbourg", "gravelines", "roubaix", "fr"],
     "se": ["sweden", "stockholm", "kista", "se"],
     "gb": ["united kingdom", "britain", "england", "london", "manchester", "uk", "gb"],
-    "pl": ["poland", "warsaw", "warszawa", "krakow", "pl"],
+    "pl": ["poland", "warsaw", "warszawa", "krakow", "gdansk", "pl"],
     "tr": ["turkey", "turkiye", "istanbul", "bursa", "ankara", "izmir", "tr"],
     "kz": ["kazakhstan", "almaty", "astana", "kz"],
     "ua": ["ukraine", "kyiv", "kiev", "lviv", "odessa", "ua"],
@@ -137,7 +156,7 @@ COUNTRY_KEYWORDS: dict[str, list[str]] = {
     "al": ["albania", "tirana", "al"],
     "rs": ["serbia", "belgrade", "rs"],
     "ae": ["uae", "dubai", "abu dhabi", "ae"],
-    "in": ["india", "mumbai", "delhi", "in"],
+    "in": ["india", "mumbai", "delhi", "bangalore", "in"],
     "kr": ["korea", "seoul", "kr"],
     "br": ["brazil", "sao paulo", "br"],
     "il": ["israel", "tel aviv", "il"],
@@ -149,10 +168,48 @@ COUNTRY_KEYWORDS: dict[str, list[str]] = {
     "lu": ["luxembourg", "lu"],
     "be": ["belgium", "brussels", "be"],
     "au": ["australia", "sydney", "melbourne", "au"],
+    "tw": ["taiwan", "taipei", "tw"],
     "eu": ["europe", "european", "eu"],
 }
 
 FLAG_EMOJI_RE = re.compile(r"[\U0001F1E6-\U0001F1FF]{2}")
+
+VALID_UTLS_FINGERPRINTS = {
+    "chrome",
+    "firefox",
+    "edge",
+    "safari",
+    "360",
+    "qq",
+    "ios",
+    "android",
+    "random",
+    "randomized",
+}
+
+GEOIP_CACHE_FILE = REPO_ROOT / ".geoip_cache.json"
+_GEOIP_MEM_CACHE: dict[str, str] = {}
+_GEOIP_CACHE_LOADED = False
+
+
+def _code_to_flag(code: str) -> str:
+    code_l = (code or "").lower().strip()
+    if code_l in FLAG_MAP:
+        return FLAG_MAP[code_l]
+    if len(code_l) == 2 and code_l.isalpha() and code_l != "xx":
+        base_code = "gb" if code_l == "uk" else code_l
+        return "".join(chr(0x1F1E6 + ord(ch) - ord("a")) for ch in base_code)
+    return "🌐"
+
+
+def _is_ipv4_or_ipv6(value: str) -> bool:
+    if not value:
+        return False
+    try:
+        ipaddress.ip_address(value.strip("[]"))
+        return True
+    except ValueError:
+        return False
 
 
 def make_sparkline(values: Sequence[float]) -> str:
@@ -187,6 +244,11 @@ class NodeCheckResult:
     http_ok: bool = False
     http_delay_ms: float = 0.0
     http_probe_msg: str = ""
+    speed_mbps: float = 0.0
+    exit_ip: str = ""
+    exit_country: str = ""
+    tls_detail: str = ""
+    sni_ok: bool = False
 
     @property
     def display_tag(self) -> str:
@@ -209,7 +271,7 @@ def detect_country_info(remark: str, host: str = "", sni: str = "") -> tuple[str
     match = FLAG_EMOJI_RE.search(remark)
     if match:
         flag = match.group(0)
-        code = "".join(chr(ord(c) - 0x1F1E6 + ord('a')) for c in flag).lower()
+        code = "".join(chr(ord(c) - 0x1F1E6 + ord("a")) for c in flag).lower()
         ru_name = COUNTRY_RU_NAMES.get(code, code.upper())
         return code, flag, ru_name
 
@@ -221,7 +283,7 @@ def detect_country_info(remark: str, host: str = "", sni: str = "") -> tuple[str
             continue
         ru_lower = ru_name.lower()
         if ru_lower in remark_lower:
-            flag = FLAG_MAP.get(code, "🌐")
+            flag = _code_to_flag(code)
             return code, flag, ru_name
 
     # 3. Search keywords across remark, host, and sni
@@ -234,12 +296,12 @@ def detect_country_info(remark: str, host: str = "", sni: str = "") -> tuple[str
                     f"{kw} |", f"#{kw}", f"-{kw}-", f".{kw}.", f" {kw} ",
                 ]
                 if any(p in combined for p in patterns):
-                    flag = FLAG_MAP.get(code, "🌐")
+                    flag = _code_to_flag(code)
                     ru_name = COUNTRY_RU_NAMES.get(code, code.upper())
                     return code, flag, ru_name
             else:
                 if kw in combined:
-                    flag = FLAG_MAP.get(code, "🌐")
+                    flag = _code_to_flag(code)
                     ru_name = COUNTRY_RU_NAMES.get(code, code.upper())
                     return code, flag, ru_name
 
@@ -252,15 +314,24 @@ def detect_country_info(remark: str, host: str = "", sni: str = "") -> tuple[str
             tld = parts[-1]
             if tld in COUNTRY_RU_NAMES and tld not in (
                 "com", "org", "net", "xyz", "site", "online", "top", "io",
-                "me", "co", "cc", "cd", "pw", "ws", "app", "dev", "click"
+                "me", "co", "cc", "cd", "pw", "ws", "app", "dev", "click",
+                "ru",  # Wait: keep .ru below? Wait: .ru in domain TLD still maps to Russia!
             ):
-                flag = FLAG_MAP.get(tld, "🌐")
+                flag = _code_to_flag(tld)
                 return tld, flag, COUNTRY_RU_NAMES[tld]
+            if tld == "ru":
+                return "ru", _code_to_flag("ru"), COUNTRY_RU_NAMES["ru"]
             sub = parts[0]
             sub_code = re.sub(r"[0-9_\-].*$", "", sub)
             if sub_code in COUNTRY_RU_NAMES and len(sub_code) == 2:
-                flag = FLAG_MAP.get(sub_code, "🌐")
+                flag = _code_to_flag(sub_code)
                 return sub_code, flag, COUNTRY_RU_NAMES[sub_code]
+
+    # 5. Check GeoIP memory cache if available for IP host
+    if host and host in _GEOIP_MEM_CACHE:
+        cached_code = _GEOIP_MEM_CACHE[host].lower()
+        if cached_code and cached_code != "xx":
+            return cached_code, _code_to_flag(cached_code), COUNTRY_RU_NAMES.get(cached_code, cached_code.upper())
 
     return "xx", "🌐", "Сервер"
 
@@ -269,6 +340,102 @@ def detect_country_flag(remark: str) -> tuple[str, str]:
     """Backward compatibility helper returning (code, flag)."""
     code, flag, _ = detect_country_info(remark)
     return code, flag
+
+
+def _load_geoip_cache() -> None:
+    global _GEOIP_CACHE_LOADED
+    if _GEOIP_CACHE_LOADED:
+        return
+    _GEOIP_CACHE_LOADED = True
+    try:
+        if GEOIP_CACHE_FILE.exists():
+            raw = json.loads(GEOIP_CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                now = time.time()
+                for ip, item in raw.items():
+                    if isinstance(item, dict) and now - float(item.get("ts", 0)) < 7 * 86400:
+                        cc = str(item.get("cc", "")).lower()
+                        if cc:
+                            _GEOIP_MEM_CACHE[ip] = cc
+    except Exception:
+        pass
+
+
+def _save_geoip_cache() -> None:
+    try:
+        now = time.time()
+        payload = {ip: {"cc": cc, "ts": now} for ip, cc in _GEOIP_MEM_CACHE.items()}
+        GEOIP_CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def enrich_country_geoip_batch(ips: Sequence[str], timeout: float = 2.0) -> dict[str, tuple[str, str, str]]:
+    """
+    Batch-resolve country codes for raw IP hosts via ip-api.com (no key, 100/req).
+    Never raises; returns {ip: (code, flag, ru_name)} for resolved entries.
+    """
+    _load_geoip_cache()
+    resolved: dict[str, tuple[str, str, str]] = {}
+    to_query: list[str] = []
+
+    for ip in ips:
+        clean_ip = (ip or "").strip("[]")
+        if not _is_ipv4_or_ipv6(clean_ip):
+            continue
+        if clean_ip in _GEOIP_MEM_CACHE:
+            cc = _GEOIP_MEM_CACHE[clean_ip]
+            if cc and cc != "xx":
+                resolved[ip] = (cc, _code_to_flag(cc), COUNTRY_RU_NAMES.get(cc, cc.upper()))
+        elif clean_ip not in to_query:
+            to_query.append(clean_ip)
+
+    if to_query:
+        updated = False
+        for i in range(0, min(len(to_query), 300), 100):
+            chunk = to_query[i:i + 100]
+            try:
+                body = json.dumps([{"query": q} for q in chunk]).encode("utf-8")
+                req = urllib.request.Request(
+                    "http://ip-api.com/batch?fields=status,query,countryCode",
+                    data=body,
+                    headers={"Content-Type": "application/json", "User-Agent": "NotaVless/3.0"},
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    items = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                if isinstance(items, list):
+                    for item in items:
+                        if item.get("status") == "success":
+                            q = item.get("query", "")
+                            cc = (item.get("countryCode") or "").lower()
+                            if q and cc:
+                                _GEOIP_MEM_CACHE[q] = cc
+                                resolved[q] = (cc, _code_to_flag(cc), COUNTRY_RU_NAMES.get(cc, cc.upper()))
+                                updated = True
+            except Exception:
+                break
+        if updated:
+            _save_geoip_cache()
+
+    return resolved
+
+
+def enrich_results_geoip(results: Sequence[NodeCheckResult], timeout: float = 2.0) -> int:
+    """Enrich alive NodeCheckResult entries that fell back to generic 'Сервер' via batch GeoIP."""
+    targets = [
+        r for r in results
+        if r.alive and r.country_code == "xx" and _is_ipv4_or_ipv6(r.config.host)
+    ]
+    if not targets:
+        return 0
+    mapping = enrich_country_geoip_batch([r.config.host for r in targets], timeout=timeout)
+    updated = 0
+    for r in targets:
+        info = mapping.get(r.config.host.strip("[]")) or mapping.get(r.config.host)
+        if info:
+            r.country_code, r.country_flag, r.country_name = info
+            updated += 1
+    return updated
 
 
 def classify_russian_tier(latency_ms: float) -> str:
@@ -300,19 +467,19 @@ def get_security_tag(cfg: ParsedConfig) -> str:
     """Format human-readable security and encryption tag."""
     sec = (cfg.security or "none").lower()
     proto = cfg.protocol.lower()
+    net = (cfg.network_type or "").lower()
+    net_suffix = f" [{net.upper()}]" if net in ("ws", "grpc", "xhttp", "splithttp", "httpupgrade") else ""
     if proto == "hysteria2":
         return "QUIC / Hysteria 2"
     if sec == "reality":
-        if cfg.flow and "vision" in cfg.flow.lower():
-            return "Reality (XTLS-Vision)"
-        if "vision" in cfg.raw_url.lower():
-            return "Reality (XTLS-Vision)"
-        return "Reality (TLS)"
+        if (cfg.flow and "vision" in cfg.flow.lower()) or "vision" in cfg.raw_url.lower():
+            return f"Reality (XTLS-Vision){net_suffix}"
+        return f"Reality (TLS){net_suffix}"
     if sec == "tls":
-        return "TLS 1.3"
+        return f"TLS 1.3{net_suffix}"
     if sec == "none":
-        return "Insecure (Plain)"
-    return sec.upper()
+        return f"Insecure (Plain){net_suffix}"
+    return f"{sec.upper()}{net_suffix}"
 
 
 def find_sing_box_executable() -> str | None:
@@ -324,6 +491,7 @@ def find_sing_box_executable() -> str | None:
         "/usr/local/bin/sing-box",
         "/usr/bin/sing-box",
         str(REPO_ROOT / "sing-box.exe"),
+        str(REPO_ROOT / "sing-box"),
     ]
     for c in candidates:
         if c and os.path.isfile(c):
@@ -343,6 +511,7 @@ def find_xray_executable() -> str | None:
         "/usr/local/bin/xray",
         "/usr/bin/xray",
         str(REPO_ROOT / "xray.exe"),
+        str(REPO_ROOT / "xray"),
     ]
     for c in candidates:
         if c and os.path.isfile(c):
@@ -353,6 +522,479 @@ def find_xray_executable() -> str | None:
     return None
 
 
+def _reserve_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _normalize_fingerprint(fp: str) -> str:
+    fp_l = (fp or "chrome").strip().lower()
+    return fp_l if fp_l in VALID_UTLS_FINGERPRINTS else "chrome"
+
+
+def build_tls_client_hello(sni: str = "") -> bytes:
+    """
+    Construct a genuine TLS 1.3/1.2 ClientHello packet with SNI, ALPN,
+    supported_groups, signature_algorithms, and X25519 key_share extensions.
+    Used for accurate DPI/TSPU SNI pass-through and Reality liveness probing.
+    """
+    exts = bytearray()
+    clean_sni = (sni or "").strip()
+    if clean_sni and not _is_ipv4_or_ipv6(clean_sni):
+        sni_b = clean_sni.encode("ascii", errors="ignore")
+        if sni_b:
+            entry = b"\x00" + struct.pack("!H", len(sni_b)) + sni_b
+            list_b = struct.pack("!H", len(entry)) + entry
+            exts += struct.pack("!HH", 0x0000, len(list_b)) + list_b
+
+    # ec_point_formats (uncompressed)
+    exts += struct.pack("!HHBB", 0x000B, 2, 1, 0)
+    # supported_groups: x25519, secp256r1
+    exts += struct.pack("!HHHHH", 0x000A, 6, 4, 0x001D, 0x0017)
+    # alpn: h2, http/1.1
+    alpn_list = b"\x02h2\x08http/1.1"
+    exts += struct.pack("!HHH", 0x0010, len(alpn_list) + 2, len(alpn_list)) + alpn_list
+    # signature_algorithms
+    sigs = struct.pack("!HHHH", 0x0403, 0x0804, 0x0401, 0x0503)
+    exts += struct.pack("!HHH", 0x000D, len(sigs) + 2, len(sigs)) + sigs
+    # key_share: x25519 (32 random bytes)
+    ks_entry = struct.pack("!HH", 0x001D, 32) + os.urandom(32)
+    exts += struct.pack("!HHH", 0x0033, len(ks_entry) + 2, len(ks_entry)) + ks_entry
+    # supported_versions: TLS 1.3 (0x0304), TLS 1.2 (0x0303)
+    vers = b"\x04\x03\x04\x03\x03"
+    exts += struct.pack("!HH", 0x002B, len(vers)) + vers
+
+    ciphers = struct.pack("!HHHH", 0x1301, 0x1302, 0xC02B, 0xC02F)
+    body = bytearray()
+    body += b"\x03\x03" + os.urandom(32)
+    body += b"\x20" + os.urandom(32)
+    body += struct.pack("!H", len(ciphers)) + ciphers
+    body += b"\x01\x00"
+    body += struct.pack("!H", len(exts)) + exts
+
+    hs = b"\x01" + struct.pack("!I", len(body))[1:] + bytes(body)
+    return b"\x16\x03\x01" + struct.pack("!H", len(hs)) + hs
+
+
+_VALID_SB_NETS = {"", "tcp", "raw", "ws", "grpc", "httpupgrade", "h2", "http", "udp"}
+_VALID_XRAY_NETS = {"", "tcp", "raw", "ws", "grpc", "xhttp", "splithttp", "httpupgrade", "h2", "http"}
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def build_sing_box_outbound(cfg: ParsedConfig, tag: str = "proxy") -> dict | None:
+    """Build a sanitized sing-box 1.12+ outbound dict for VLESS, Trojan, or Hysteria 2."""
+    proto = (cfg.protocol or "").lower()
+    net = (cfg.network_type or "tcp").lower()
+    sec = (cfg.security or "").lower()
+
+    if net not in _VALID_SB_NETS or net in ("xhttp", "splithttp"):
+        return None
+    if proto == "vless" and sec == "reality" and not cfg.public_key:
+        return None
+
+    outbound: dict = {
+        "type": proto,
+        "tag": tag,
+        "server": cfg.host,
+        "server_port": cfg.port,
+    }
+    sni = cfg.sni or cfg.host
+    fp = _normalize_fingerprint(cfg.fingerprint)
+
+    if proto == "vless":
+        outbound["uuid"] = cfg.uuid
+        if net in ("", "tcp", "raw"):
+            flow_l = (cfg.flow or "").lower()
+            if flow_l.startswith("xtls-rprx-vision"):
+                outbound["flow"] = "xtls-rprx-vision"
+        elif net == "ws":
+            host_hdr = cfg.host_header if (cfg.host_header and not cfg.host_header.startswith("/")) else sni
+            outbound["transport"] = {
+                "type": "ws",
+                "path": cfg.path or "/",
+                "headers": {"Host": host_hdr},
+            }
+        elif net == "grpc":
+            outbound["transport"] = {
+                "type": "grpc",
+                "service_name": cfg.service_name or cfg.path or "grpc",
+            }
+        elif net == "httpupgrade":
+            host_hdr = cfg.host_header if (cfg.host_header and not cfg.host_header.startswith("/")) else sni
+            outbound["transport"] = {
+                "type": "httpupgrade",
+                "path": cfg.path or "/",
+                "host": host_hdr,
+            }
+
+        tls_dict: dict = {
+            "enabled": True,
+            "server_name": sni,
+            "utls": {"enabled": True, "fingerprint": fp},
+        }
+        if sec == "reality":
+            tls_dict["reality"] = {
+                "enabled": True,
+                "public_key": cfg.public_key,
+                "short_id": cfg.short_id or "",
+            }
+        else:
+            tls_dict["insecure"] = True
+        if cfg.alpn and net not in ("ws", "httpupgrade"):
+            alpn_list = [a.strip() for a in cfg.alpn.split(",") if a.strip()]
+            if alpn_list:
+                tls_dict["alpn"] = alpn_list
+        outbound["tls"] = tls_dict
+        return outbound
+
+    if proto == "trojan":
+        outbound["password"] = cfg.uuid
+        outbound["tls"] = {
+            "enabled": True,
+            "server_name": sni,
+            "insecure": True,
+        }
+        if net == "ws":
+            host_hdr = cfg.host_header if (cfg.host_header and not cfg.host_header.startswith("/")) else sni
+            outbound["transport"] = {
+                "type": "ws",
+                "path": cfg.path or "/",
+                "headers": {"Host": host_hdr},
+            }
+        elif net == "grpc":
+            outbound["transport"] = {
+                "type": "grpc",
+                "service_name": cfg.service_name or cfg.path or "grpc",
+            }
+        elif net == "httpupgrade":
+            host_hdr = cfg.host_header if (cfg.host_header and not cfg.host_header.startswith("/")) else sni
+            outbound["transport"] = {
+                "type": "httpupgrade",
+                "path": cfg.path or "/",
+                "host": host_hdr,
+            }
+        return outbound
+
+    if proto in ("hysteria2", "hy2"):
+        outbound["type"] = "hysteria2"
+        outbound["password"] = cfg.uuid
+        tls_dict = {
+            "enabled": True,
+            "server_name": sni,
+            "insecure": True,
+        }
+        if cfg.alpn:
+            alpn_list = [a.strip() for a in cfg.alpn.split(",") if a.strip()]
+            if alpn_list:
+                tls_dict["alpn"] = alpn_list
+        outbound["tls"] = tls_dict
+        if cfg.obfs:
+            outbound["obfs"] = {
+                "type": cfg.obfs,
+                "password": cfg.obfs_password or "",
+            }
+        return outbound
+
+    return None
+
+
+def build_xray_outbound(cfg: ParsedConfig, tag: str = "proxy") -> dict | None:
+    """Build an Xray 26+ compatible outbound dict (supports xhttp, grpc, ws, tcp, reality, tls)."""
+    proto = (cfg.protocol or "").lower()
+    if proto not in ("vless", "trojan"):
+        return None
+    sec = (cfg.security or "tls").lower()
+    if proto == "vless" and sec == "reality" and not cfg.public_key:
+        return None
+
+    net = (cfg.network_type or "tcp").lower()
+    if net not in _VALID_XRAY_NETS:
+        return None
+    xray_net = "tcp" if net in ("", "tcp", "raw") else ("xhttp" if net in ("xhttp", "splithttp") else net)
+    sni = cfg.sni or cfg.host
+    fp = _normalize_fingerprint(cfg.fingerprint)
+
+    stream: dict = {"network": xray_net}
+    if xray_net == "ws":
+        host_hdr = cfg.host_header if (cfg.host_header and not cfg.host_header.startswith("/")) else sni
+        stream["wsSettings"] = {"path": cfg.path or "/", "headers": {"Host": host_hdr}}
+    elif xray_net == "grpc":
+        stream["grpcSettings"] = {"serviceName": cfg.service_name or cfg.path or "grpc"}
+    elif xray_net == "httpupgrade":
+        host_hdr = cfg.host_header if (cfg.host_header and not cfg.host_header.startswith("/")) else sni
+        stream["httpupgradeSettings"] = {"path": cfg.path or "/", "host": host_hdr}
+    elif xray_net == "xhttp":
+        xhttp_cfg: dict = {"path": cfg.path or "/", "mode": cfg.mode or "auto"}
+        if cfg.host_header and not cfg.host_header.startswith("/"):
+            xhttp_cfg["host"] = cfg.host_header
+        stream["xhttpSettings"] = xhttp_cfg
+
+    if sec == "reality":
+        stream["security"] = "reality"
+        stream["realitySettings"] = {
+            "serverName": sni,
+            "fingerprint": fp,
+            "publicKey": cfg.public_key,
+            "shortId": cfg.short_id or "",
+        }
+    elif sec == "tls":
+        stream["security"] = "tls"
+        tls_cfg: dict = {"serverName": sni, "fingerprint": fp}
+        if cfg.pin_sha256:
+            tls_cfg["pinnedPeerCertSha256"] = cfg.pin_sha256
+        stream["tlsSettings"] = tls_cfg
+
+    if proto == "vless":
+        user: dict = {"id": cfg.uuid, "encryption": "none"}
+        if cfg.flow and xray_net == "tcp":
+            user["flow"] = cfg.flow
+        return {
+            "tag": tag,
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": cfg.host, "port": cfg.port, "users": [user]}]},
+            "streamSettings": stream,
+        }
+
+    # trojan
+    return {
+        "tag": tag,
+        "protocol": "trojan",
+        "settings": {"servers": [{"address": cfg.host, "port": cfg.port, "password": cfg.uuid}]},
+        "streamSettings": stream,
+    }
+
+
+def _probe_batch_sing_box_sync(
+    items: list[tuple[NodeCheckResult, dict]],
+    timeout: float,
+    test_url: str,
+    concurrency: int,
+    progress_cb: Callable[[NodeCheckResult], None] | None = None,
+) -> None:
+    """Probe a batch of nodes using ONE persistent sing-box Clash API instance."""
+    sb = find_sing_box_executable()
+    if not sb or not items:
+        return
+
+    api_port = _reserve_free_port()
+    outbounds = [ob for _, ob in items]
+    sb_config = {
+        "log": {"level": "error"},
+        "experimental": {"clash_api": {"external_controller": f"127.0.0.1:{api_port}"}},
+        "outbounds": outbounds,
+    }
+
+    cfg_path = ""
+    proc: subprocess.Popen | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(sb_config, f)
+            cfg_path = f.name
+
+        proc = subprocess.Popen(
+            [sb, "run", "-c", cfg_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        ready = False
+        for _ in range(60):
+            if proc.poll() is not None:
+                break
+            try:
+                with _LOCAL_OPENER.open(f"http://127.0.0.1:{api_port}/version", timeout=0.4) as r:
+                    if r.status == 200:
+                        ready = True
+                        break
+            except Exception:
+                time.sleep(0.1)
+
+        if not ready:
+            # If sing-box failed to boot on a huge batch (e.g. one malformed field), split cleanly
+            if len(items) > 1:
+                mid = len(items) // 2
+                _probe_batch_sing_box_sync(items[:mid], timeout, test_url, concurrency, progress_cb)
+                _probe_batch_sing_box_sync(items[mid:], timeout, test_url, concurrency, progress_cb)
+            else:
+                res = items[0][0]
+                res.http_ok = False
+                res.http_delay_ms = 9999.0
+                res.http_probe_msg = "Core init error"
+                if progress_cb:
+                    progress_cb(res)
+            return
+
+        encoded_url = urllib.parse.quote(test_url, safe="")
+        timeout_ms = max(1000, int(timeout * 1000))
+
+        def query_one(pair: tuple[NodeCheckResult, dict]) -> None:
+            res, ob = pair
+            tag = ob["tag"]
+            api_url = f"http://127.0.0.1:{api_port}/proxies/{urllib.parse.quote(tag, safe='')}/delay?timeout={timeout_ms}&url={encoded_url}"
+            try:
+                with _LOCAL_OPENER.open(api_url, timeout=timeout + 1.5) as resp:
+                    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                    delay = float(data.get("delay", 0))
+                    if delay > 0:
+                        res.http_ok = True
+                        res.http_delay_ms = round(delay, 1)
+                        res.http_probe_msg = f"204 OK ({delay:.0f}ms)"
+                    else:
+                        res.http_ok = False
+                        res.http_delay_ms = 9999.0
+                        res.http_probe_msg = "Empty delay"
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="ignore")
+                msg = "Timeout"
+                try:
+                    msg = json.loads(body).get("message", msg)
+                except Exception:
+                    pass
+                res.http_ok = False
+                res.http_delay_ms = 9999.0
+                res.http_probe_msg = str(msg)[:24]
+            except Exception as exc:
+                res.http_ok = False
+                res.http_delay_ms = 9999.0
+                res.http_probe_msg = str(exc)[:24]
+            finally:
+                if progress_cb:
+                    progress_cb(res)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(concurrency, len(items)))) as pool:
+            list(pool.map(query_one, items))
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if cfg_path and os.path.exists(cfg_path):
+            try:
+                os.unlink(cfg_path)
+            except Exception:
+                pass
+
+
+def _probe_batch_xray_sync(
+    items: list[tuple[NodeCheckResult, dict]],
+    timeout: float,
+    test_url: str,
+    concurrency: int,
+    progress_cb: Callable[[NodeCheckResult], None] | None = None,
+) -> None:
+    """Probe a batch of nodes (such as VLESS xhttp) using ONE Xray multi-inbound process."""
+    xr = find_xray_executable()
+    if not xr or not items:
+        return
+
+    inbounds: list[dict] = []
+    outbounds: list[dict] = []
+    rules: list[dict] = []
+    port_items: list[tuple[int, NodeCheckResult]] = []
+
+    for idx, (res, ob) in enumerate(items):
+        port = _reserve_free_port()
+        in_tag = f"in_{idx}"
+        out_tag = ob["tag"]
+        inbounds.append({"tag": in_tag, "port": port, "listen": "127.0.0.1", "protocol": "http"})
+        outbounds.append(ob)
+        rules.append({"type": "field", "inboundTag": [in_tag], "outboundTag": out_tag})
+        port_items.append((port, res))
+
+    xcfg = {
+        "log": {"loglevel": "error"},
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {"domainStrategy": "AsIs", "rules": rules},
+    }
+
+    cfg_path = ""
+    proc: subprocess.Popen | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(xcfg, f)
+            cfg_path = f.name
+
+        proc = subprocess.Popen(
+            [xr, "run", "-c", cfg_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        first_port = port_items[0][0]
+        ready = False
+        for _ in range(40):
+            if proc.poll() is not None:
+                break
+            try:
+                with socket.create_connection(("127.0.0.1", first_port), timeout=0.15):
+                    ready = True
+                    break
+            except Exception:
+                time.sleep(0.05)
+
+        if not ready:
+            if len(items) > 1:
+                mid = len(items) // 2
+                _probe_batch_xray_sync(items[:mid], timeout, test_url, concurrency, progress_cb)
+                _probe_batch_xray_sync(items[mid:], timeout, test_url, concurrency, progress_cb)
+            else:
+                res = items[0][0]
+                res.http_ok = False
+                res.http_delay_ms = 9999.0
+                res.http_probe_msg = "Xray init error"
+                if progress_cb:
+                    progress_cb(res)
+            return
+
+        def probe_one(pair: tuple[int, NodeCheckResult]) -> None:
+            port, res = pair
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"})
+            )
+            t0 = time.perf_counter()
+            try:
+                with opener.open(test_url, timeout=timeout) as resp:
+                    dt = (time.perf_counter() - t0) * 1000.0
+                    if 200 <= resp.status < 400:
+                        res.http_ok = True
+                        res.http_delay_ms = round(dt, 1)
+                        res.http_probe_msg = f"{resp.status} OK ({dt:.0f}ms)"
+                    else:
+                        res.http_ok = False
+                        res.http_delay_ms = 9999.0
+                        res.http_probe_msg = f"HTTP {resp.status}"
+            except Exception as exc:
+                res.http_ok = False
+                res.http_delay_ms = 9999.0
+                res.http_probe_msg = str(exc)[:24]
+            finally:
+                if progress_cb:
+                    progress_cb(res)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(concurrency, len(port_items)))) as pool:
+            list(pool.map(probe_one, port_items))
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if cfg_path and os.path.exists(cfg_path):
+            try:
+                os.unlink(cfg_path)
+            except Exception:
+                pass
+
+
 def probe_proxy_http_sync(
     cfg: ParsedConfig,
     timeout: float = 4.0,
@@ -360,97 +1002,48 @@ def probe_proxy_http_sync(
 ) -> tuple[bool, float, str]:
     """
     Perform a real end-to-end HTTP proxy delay test.
-    Attempts sing-box tools fetch first; falls back to pure Python socket probe for Trojan/TLS.
+    Routes xhttp/splithttp to Xray; VLESS/Trojan/Hysteria2 to sing-box Clash API (with Xray fallback);
+    falls back to pure Python socket probe for Trojan TLS if no core binaries exist.
     Returns: (success: bool, delay_ms: float, detail: str)
     """
-    sing_box = find_sing_box_executable()
-    if sing_box:
-        outbound: dict = {
-            "type": cfg.protocol,
-            "tag": "proxy",
-            "server": cfg.host,
-            "server_port": cfg.port,
-        }
-        if cfg.protocol == "vless":
-            outbound["uuid"] = cfg.uuid
-            outbound["flow"] = cfg.flow or "xtls-rprx-vision"
-            tls_dict: dict = {
-                "enabled": True,
-                "server_name": cfg.sni or cfg.host,
-                "utls": {"enabled": True, "fingerprint": cfg.fingerprint or "chrome"},
-            }
-            if cfg.security == "reality":
-                tls_dict["reality"] = {
-                    "enabled": True,
-                    "public_key": cfg.public_key,
-                    "short_id": cfg.short_id,
-                }
-            outbound["tls"] = tls_dict
-        elif cfg.protocol == "trojan":
-            outbound["password"] = cfg.uuid
-            outbound["tls"] = {
-                "enabled": True,
-                "server_name": cfg.sni or cfg.host,
-                "insecure": True,
-            }
-            if cfg.network_type == "ws":
-                outbound["transport"] = {
-                    "type": "ws",
-                    "path": cfg.path or "/",
-                    "headers": {"Host": cfg.host_header or cfg.sni or cfg.host},
-                }
-        elif cfg.protocol in ("hysteria2", "hy2"):
-            outbound["password"] = cfg.uuid
-            outbound["tls"] = {
-                "enabled": True,
-                "server_name": cfg.sni or cfg.host,
-                "insecure": True,
-            }
+    dummy_res = NodeCheckResult(
+        config=cfg,
+        alive=True,
+        latency_ms=0.0,
+        tls_ok=True,
+        country_code="xx",
+        country_flag="🌐",
+        country_name="Сервер",
+        quality_tier="⚡ ULTRA",
+    )
 
-        sb_config = {"outbounds": [outbound]}
-        cfg_path = ""
-        try:
-            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-                json.dump(sb_config, f)
-                cfg_path = f.name
+    net = (cfg.network_type or "").lower()
+    sb = find_sing_box_executable()
+    xr = find_xray_executable()
 
-            t0 = time.perf_counter()
-            proc = subprocess.run(
-                [sing_box, "tools", "fetch", test_url, "-c", cfg_path],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            dt = (time.perf_counter() - t0) * 1000.0
-            if proc.returncode == 0:
-                return True, round(dt, 1), f"204 OK ({dt:.0f}ms)"
+    # 1. XHTTP / splithttp -> Xray natively
+    if net in ("xhttp", "splithttp") and xr:
+        ob = build_xray_outbound(cfg, tag="proxy")
+        if ob:
+            _probe_batch_xray_sync([(dummy_res, ob)], timeout=timeout, test_url=test_url, concurrency=1)
+            return dummy_res.http_ok, dummy_res.http_delay_ms, dummy_res.http_probe_msg or "Xray probe failed"
 
-            err_line = ""
-            for line in proc.stderr.splitlines():
-                if any(k in line for k in ("FATAL", "ERROR", "panic")):
-                    cleaned = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
-                    if '": ' in cleaned:
-                        err_line = cleaned.split('": ', 1)[1].strip()
-                    elif ": " in cleaned:
-                        err_line = cleaned.rsplit(": ", 1)[1].strip()
-                    else:
-                        err_line = cleaned
-                    break
-            if not err_line:
-                err_line = "Proxy connection failed"
-            return False, 9999.0, err_line[:30]
-        except subprocess.TimeoutExpired:
-            return False, 9999.0, "HTTP Probe Timeout"
-        except Exception as exc:
-            return False, 9999.0, str(exc)[:40]
-        finally:
-            if cfg_path and os.path.exists(cfg_path):
-                try:
-                    os.unlink(cfg_path)
-                except Exception:
-                    pass
+    # 2. sing-box Clash API (true proxy delay excluding startup time!)
+    if sb:
+        ob = build_sing_box_outbound(cfg, tag="proxy")
+        if ob:
+            _probe_batch_sing_box_sync([(dummy_res, ob)], timeout=timeout, test_url=test_url, concurrency=1)
+            if dummy_res.http_ok or not xr:
+                return dummy_res.http_ok, dummy_res.http_delay_ms, dummy_res.http_probe_msg or "Proxy probe failed"
 
-    # Pure Python Fallback for Trojan TLS
+    # 3. Xray fallback for VLESS / Trojan
+    if xr:
+        ob = build_xray_outbound(cfg, tag="proxy")
+        if ob:
+            _probe_batch_xray_sync([(dummy_res, ob)], timeout=timeout, test_url=test_url, concurrency=1)
+            return dummy_res.http_ok, dummy_res.http_delay_ms, dummy_res.http_probe_msg or "Xray probe failed"
+
+    # 4. Pure Python Fallback for Trojan TLS
     if cfg.protocol == "trojan" and cfg.security == "tls":
         try:
             t0 = time.perf_counter()
@@ -498,52 +1091,352 @@ async def probe_proxy_http(
     return await loop.run_in_executor(None, probe_proxy_http_sync, cfg, timeout, test_url)
 
 
+def _select_diverse_probe_candidates(alive: list[NodeCheckResult], limit: int) -> list[NodeCheckResult]:
+    """
+    Pick top alive candidates while avoiding wasting the entire HTTP probe budget
+    on identical clones from a single /24 subnet or UUID cluster.
+    """
+    if len(alive) <= limit:
+        return list(alive)
+
+    selected: list[NodeCheckResult] = []
+    overflow: list[NodeCheckResult] = []
+    subnet_counts: dict[str, int] = {}
+    uuid_counts: dict[str, int] = {}
+
+    for r in alive:
+        parts = r.config.host.split(".")
+        subnet = ".".join(parts[:3]) if len(parts) == 4 and all(p.isdigit() for p in parts) else r.config.host
+        uk = r.config.uuid[:16]
+        if subnet_counts.get(subnet, 0) < 2 and uuid_counts.get(uk, 0) < 3:
+            selected.append(r)
+            subnet_counts[subnet] = subnet_counts.get(subnet, 0) + 1
+            uuid_counts[uk] = uuid_counts.get(uk, 0) + 1
+        else:
+            overflow.append(r)
+        if len(selected) >= limit:
+            return selected
+
+    for r in overflow:
+        if len(selected) >= limit:
+            break
+        selected.append(r)
+    return selected
+
+
 async def probe_nodes_http_batch(
     results: list[NodeCheckResult],
-    top_n: int = 15,
-    concurrency: int = 4,
+    top_n: int = 40,
+    concurrency: int = 24,
     progress_cb: Callable[[int, int, NodeCheckResult], None] | None = None,
+    test_url: str = "http://cp.cloudflare.com/generate_204",
+    timeout: float = 4.0,
+    smart_select: bool = True,
 ) -> list[NodeCheckResult]:
-    """Probe top alive nodes with real end-to-end HTTP proxy delay test."""
-    alive = [r for r in results if r.alive][:top_n]
-    if not alive:
+    """
+    Probe top alive nodes with real end-to-end HTTP proxy delay test using
+    high-speed dual-core batch execution (sing-box Clash API + Xray multi-inbound).
+    """
+    alive_all = [r for r in results if r.alive]
+    if not alive_all:
         return results
 
-    sem = asyncio.Semaphore(concurrency)
+    candidates = _select_diverse_probe_candidates(alive_all, top_n) if smart_select else alive_all[:top_n]
+    if not candidates:
+        return results
+
+    sb = find_sing_box_executable()
+    xr = find_xray_executable()
+    sb_items: list[tuple[NodeCheckResult, dict]] = []
+    xr_items: list[tuple[NodeCheckResult, dict]] = []
+    fallback_items: list[NodeCheckResult] = []
+
+    for idx, res in enumerate(candidates):
+        tag = f"n{idx}"
+        net = (res.config.network_type or "").lower()
+        if net in ("xhttp", "splithttp"):
+            ob = build_xray_outbound(res.config, tag=tag) if xr else None
+            if ob:
+                xr_items.append((res, ob))
+            else:
+                fallback_items.append(res)
+        elif sb:
+            ob = build_sing_box_outbound(res.config, tag=tag)
+            if ob:
+                sb_items.append((res, ob))
+            elif xr:
+                xob = build_xray_outbound(res.config, tag=tag)
+                if xob:
+                    xr_items.append((res, xob))
+                else:
+                    fallback_items.append(res)
+            else:
+                fallback_items.append(res)
+        elif xr:
+            xob = build_xray_outbound(res.config, tag=tag)
+            if xob:
+                xr_items.append((res, xob))
+            else:
+                fallback_items.append(res)
+        else:
+            fallback_items.append(res)
+
+    total = len(candidates)
     done_count = 0
-    total = len(alive)
+    loop = asyncio.get_running_loop()
 
-    async def worker(r: NodeCheckResult) -> None:
+    def on_one_done(r: NodeCheckResult) -> None:
         nonlocal done_count
-        async with sem:
-            ok, delay_ms, msg = await probe_proxy_http(r.config, timeout=3.5)
-            r.http_ok = ok
-            r.http_delay_ms = delay_ms
-            r.http_probe_msg = msg
-            done_count += 1
-            if progress_cb:
-                progress_cb(done_count, total, r)
+        done_count += 1
+        if progress_cb:
+            loop.call_soon_threadsafe(progress_cb, done_count, total, r)
 
-    await asyncio.gather(*(worker(r) for r in alive))
+    tasks: list[asyncio.Future] = []
+    if sb_items:
+        tasks.append(
+            loop.run_in_executor(
+                None,
+                _probe_batch_sing_box_sync,
+                sb_items,
+                timeout,
+                test_url,
+                concurrency,
+                on_one_done,
+            )
+        )
+    if xr_items:
+        tasks.append(
+            loop.run_in_executor(
+                None,
+                _probe_batch_xray_sync,
+                xr_items,
+                timeout,
+                test_url,
+                min(concurrency, 20),
+                on_one_done,
+            )
+        )
 
-    # Re-sort results: HTTP verified alive first, then by lowest latency
-    results.sort(key=lambda r: (
-        not r.alive,
-        not r.http_ok,
-        r.http_delay_ms if r.http_ok else 9999.0,
-        r.latency_ms,
-    ))
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    if fallback_items:
+        sem = asyncio.Semaphore(4)
+
+        async def fb_worker(r: NodeCheckResult) -> None:
+            nonlocal done_count
+            async with sem:
+                ok, delay_ms, msg = await probe_proxy_http(r.config, timeout=timeout, test_url=test_url)
+                r.http_ok = ok
+                r.http_delay_ms = delay_ms
+                r.http_probe_msg = msg
+                done_count += 1
+                if progress_cb:
+                    progress_cb(done_count, total, r)
+
+        await asyncio.gather(*(fb_worker(r) for r in fallback_items))
+
+    # Re-sort results: HTTP verified alive first (sorted by HTTP delay), then TLS alive, then remaining alive
+    results.sort(
+        key=lambda r: (
+            not r.alive,
+            not r.http_ok,
+            r.http_delay_ms if r.http_ok else 9999.0,
+            not r.tls_ok,
+            r.config.protocol == "hysteria2",
+            r.latency_ms,
+        )
+    )
     return results
+
+
+def _run_temp_http_proxy(cfg: ParsedConfig) -> tuple[subprocess.Popen | None, int, str]:
+    """Start a temporary local HTTP proxy for single-node speed/exit-IP checks."""
+    xr = find_xray_executable()
+    sb = find_sing_box_executable()
+    port = _reserve_free_port()
+    net = (cfg.network_type or "").lower()
+
+    # Prefer Xray for VLESS/Trojan (0.28s boot), sing-box for Hysteria2 or fallback
+    if xr and cfg.protocol in ("vless", "trojan"):
+        ob = build_xray_outbound(cfg, tag="proxy")
+        if ob:
+            xcfg = {
+                "log": {"loglevel": "error"},
+                "inbounds": [{"tag": "in_http", "port": port, "listen": "127.0.0.1", "protocol": "http"}],
+                "outbounds": [ob],
+            }
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+                json.dump(xcfg, f)
+                cfg_path = f.name
+            proc = subprocess.Popen([xr, "run", "-c", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(30):
+                if proc.poll() is not None:
+                    break
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+                        return proc, port, cfg_path
+                except Exception:
+                    time.sleep(0.05)
+            proc.terminate()
+            return None, 0, cfg_path
+
+    if sb and net not in ("xhttp", "splithttp"):
+        ob = build_sing_box_outbound(cfg, tag="proxy")
+        if ob:
+            sb_cfg = {
+                "log": {"level": "error"},
+                "inbounds": [{"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": port}],
+                "outbounds": [ob],
+            }
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+                json.dump(sb_cfg, f)
+                cfg_path = f.name
+            proc = subprocess.Popen([sb, "run", "-c", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(50):
+                if proc.poll() is not None:
+                    break
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+                        return proc, port, cfg_path
+                except Exception:
+                    time.sleep(0.1)
+            proc.terminate()
+            return None, 0, cfg_path
+
+    return None, 0, ""
+
+
+def measure_node_speed_sync(
+    cfg: ParsedConfig,
+    byte_limit: int = 524288,
+    timeout: float = 6.0,
+) -> tuple[bool, float, int, float, str]:
+    """
+    Download a payload through the proxy to measure real throughput (Mbps).
+    Returns: (ok, mbps, bytes_read, elapsed_s, detail)
+    """
+    proc, port, cfg_path = _run_temp_http_proxy(cfg)
+    try:
+        if not proc or not port:
+            return False, 0.0, 0, 0.0, "No proxy core available"
+
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"})
+        )
+        test_urls = [
+            f"https://speed.cloudflare.com/__down?bytes={byte_limit}",
+            f"http://speed.cloudflare.com/__down?bytes={byte_limit}",
+            "http://proof.ovh.net/files/1Mb.dat",
+            "https://fsn1-speed.hetzner.com/100MB.bin",
+        ]
+        for url in test_urls:
+            try:
+                t0 = time.perf_counter()
+                total_bytes = 0
+                with opener.open(url, timeout=timeout) as resp:
+                    while True:
+                        chunk = resp.read(32768)
+                        if not chunk:
+                            break
+                        total_bytes += len(chunk)
+                        if total_bytes >= byte_limit or time.perf_counter() - t0 > timeout:
+                            break
+                dt = max(0.01, time.perf_counter() - t0)
+                if total_bytes > 0:
+                    mbps = round((total_bytes * 8.0) / (dt * 1_000_000.0), 2)
+                    return True, mbps, total_bytes, round(dt, 2), f"{mbps:.1f} Mbps"
+            except Exception:
+                continue
+        return False, 0.0, 0, 0.0, "Speed test failed"
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if cfg_path and os.path.exists(cfg_path):
+            try:
+                os.unlink(cfg_path)
+            except Exception:
+                pass
+
+
+async def measure_node_speed(
+    cfg: ParsedConfig,
+    byte_limit: int = 524288,
+    timeout: float = 6.0,
+) -> tuple[bool, float, int, float, str]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, measure_node_speed_sync, cfg, byte_limit, timeout)
+
+
+def probe_proxy_exit_ip_sync(cfg: ParsedConfig, timeout: float = 4.0) -> tuple[bool, str, str, str]:
+    """
+    Query external IP, country, and ISP through the proxy tunnel.
+    Returns: (ok, ip, country_display, isp)
+    """
+    proc, port, cfg_path = _run_temp_http_proxy(cfg)
+    try:
+        if not proc or not port:
+            return False, "", "", "No proxy core"
+
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"})
+        )
+        try:
+            with opener.open("http://ip-api.com/json/?fields=status,query,country,countryCode,isp", timeout=timeout) as r:
+                data = json.loads(r.read().decode("utf-8", errors="ignore"))
+                if data.get("status") == "success":
+                    cc = (data.get("countryCode") or "").lower()
+                    flag = _code_to_flag(cc)
+                    ru_name = COUNTRY_RU_NAMES.get(cc, data.get("country", cc.upper()))
+                    return True, data.get("query", ""), f"{flag} {ru_name}", data.get("isp", "")
+        except Exception:
+            pass
+
+        try:
+            with opener.open("http://ifconfig.me/ip", timeout=timeout) as r:
+                ip = r.read().decode("utf-8", errors="ignore").strip()
+                if ip:
+                    return True, ip, "🌐", ""
+        except Exception:
+            pass
+        return False, "", "", "Exit IP lookup failed"
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if cfg_path and os.path.exists(cfg_path):
+            try:
+                os.unlink(cfg_path)
+            except Exception:
+                pass
+
+
+async def probe_proxy_exit_ip(cfg: ParsedConfig, timeout: float = 4.0) -> tuple[bool, str, str, str]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, probe_proxy_exit_ip_sync, cfg, timeout)
 
 
 async def check_node_advanced(
     cfg: ParsedConfig,
     timeout: float = 2.5,
-    samples_count: int = 2,
+    samples_count: int = 3,
 ) -> NodeCheckResult:
     """
     Perform deep connection latency check, multi-sample jitter calculation,
-    zombie/EOF detection, and TLS/DPI handshake verification.
+    zombie/EOF detection, and real TLS 1.3 ClientHello SNI/DPI verification.
     """
     code, flag, ru_name = detect_country_info(cfg.remark, cfg.host, cfg.sni)
     sec_tag = get_security_tag(cfg)
@@ -567,7 +1460,7 @@ async def check_node_advanced(
                 error_msg="Insecure port/proto",
             )
 
-    # Hysteria 2 probe (UDP reachability check)
+    # Hysteria 2 probe (DNS + UDP socket bind/connect check)
     if cfg.protocol == "hysteria2":
         try:
             loop = asyncio.get_running_loop()
@@ -578,8 +1471,15 @@ async def check_node_advanced(
             )
             dns_time = (time.perf_counter() - t0) * 1000.0
             alive = bool(res)
-            # Baseline realistic latency for Hysteria 2
-            rtt = max(120.0, dns_time * 2.0)
+            if alive:
+                # Verify UDP socket can target remote address without local routing failure
+                af, socktype, proto_num, _, sockaddr = res[0]
+                sock = socket.socket(af, socket.SOCK_DGRAM)
+                try:
+                    sock.connect(sockaddr)
+                finally:
+                    sock.close()
+            rtt = max(95.0, dns_time * 2.0)
             tier = classify_tier(rtt, alive)
             return NodeCheckResult(
                 config=cfg,
@@ -588,6 +1488,7 @@ async def check_node_advanced(
                 avg_latency_ms=round(rtt, 1),
                 jitter_ms=2.5,
                 tls_ok=alive,
+                tls_detail="UDP/QUIC DNS OK",
                 country_code=code,
                 country_flag=flag,
                 country_name=ru_name,
@@ -616,9 +1517,11 @@ async def check_node_advanced(
     # TCP / TLS Multi-sample probe for VLESS & Trojan
     samples: list[float] = []
     tls_success = False
+    sni_ok = False
+    tls_detail = ""
 
     try:
-        # Sample 1: First connection & Handshake probe
+        # Sample 1: TCP connect + Zombie/RST detection + Genuine TLS 1.3 ClientHello SNI probe
         t0 = time.perf_counter()
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(cfg.host, cfg.port),
@@ -627,13 +1530,9 @@ async def check_node_advanced(
         sample1 = (time.perf_counter() - t0) * 1000.0
         samples.append(sample1)
 
-        # Zombie / EOF Socket check: ensure remote didn't immediately close/RST
         try:
-            # Short zero-delay check to detect instant FIN/RST
-            chunk = await asyncio.wait_for(reader.read(1), timeout=0.04)
-            # If server sent unexpected early data or stayed open without EOF, it's alive
+            await asyncio.wait_for(reader.read(1), timeout=0.03)
         except asyncio.TimeoutError:
-            # Timeout is normal: proxy is waiting for client Hello
             pass
         except ConnectionResetError:
             writer.close()
@@ -671,54 +1570,34 @@ async def check_node_advanced(
                 error_msg="Zombie EOF socket",
             )
 
-        # TLS / DPI Handshake verification
         target_sni = cfg.sni or cfg.host
-        if cfg.security == "tls" and target_sni:
-            try:
-                ssl_ctx = ssl.create_default_context()
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = ssl.CERT_NONE
-                tls_reader, tls_writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        cfg.host,
-                        cfg.port,
-                        ssl=ssl_ctx,
-                        server_hostname=target_sni,
-                    ),
-                    timeout=max(1.5, timeout * 0.7),
-                )
+        hello = build_tls_client_hello(target_sni)
+        try:
+            writer.write(hello)
+            await writer.drain()
+            tls_resp = await asyncio.wait_for(reader.read(64), timeout=max(1.5, timeout * 0.75))
+            if tls_resp.startswith(b"\x16\x03"):
                 tls_success = True
-                tls_writer.close()
-                await tls_writer.wait_closed()
-            except Exception:
-                tls_success = False
-        elif cfg.security == "reality":
-            # For Reality: standard TLS ClientHello tests reachability and SNI pass-through
-            try:
-                ssl_ctx = ssl.create_default_context()
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = ssl.CERT_NONE
-                tls_reader, tls_writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        cfg.host,
-                        cfg.port,
-                        ssl=ssl_ctx,
-                        server_hostname=target_sni,
-                    ),
-                    timeout=max(1.5, timeout * 0.7),
-                )
+                sni_ok = True
+                tls_detail = "ServerHello (SNI OK)"
+            elif tls_resp.startswith(b"\x15\x03"):
                 tls_success = True
-                tls_writer.close()
-                await tls_writer.wait_closed()
-            except (asyncio.TimeoutError, ConnectionResetError):
-                # Dropped by TSPU or unreachable SNI
+                tls_detail = "TLS Alert (DPI Pass)"
+            elif not tls_resp:
                 tls_success = False
-            except Exception as exc:
-                # Reality servers might return TLS alert or close upon non-uTLS client hello
-                msg = str(exc).lower()
-                tls_success = any(k in msg for k in ("certificate", "handshake", "alert", "unknown protocol", "sslv3"))
-        else:
-            tls_success = True
+                tls_detail = "TLS EOF Drop"
+            else:
+                tls_success = False
+                tls_detail = "Non-TLS response"
+        except asyncio.TimeoutError:
+            tls_success = False
+            tls_detail = "TLS Timeout (DPI Drop)"
+        except ConnectionResetError:
+            tls_success = False
+            tls_detail = "TLS Reset (TSPU RST)"
+        except Exception as exc:
+            tls_success = False
+            tls_detail = str(exc)[:28]
 
         writer.close()
         try:
@@ -726,27 +1605,26 @@ async def check_node_advanced(
         except Exception:
             pass
 
-        # Sample 2: Quick follow-up connection for jitter measurement
-        if samples_count > 1:
+        # Additional quick TCP samples for accurate jitter & sparklines
+        for _ in range(max(0, samples_count - 1)):
             try:
-                t1 = time.perf_counter()
-                _, writer2 = await asyncio.wait_for(
+                t_n = time.perf_counter()
+                _, writer_n = await asyncio.wait_for(
                     asyncio.open_connection(cfg.host, cfg.port),
                     timeout=min(1.5, timeout),
                 )
-                sample2 = (time.perf_counter() - t1) * 1000.0
-                samples.append(sample2)
-                writer2.close()
+                samples.append((time.perf_counter() - t_n) * 1000.0)
+                writer_n.close()
                 try:
-                    await writer2.wait_closed()
+                    await writer_n.wait_closed()
                 except Exception:
                     pass
             except Exception:
-                pass
+                break
 
         min_rtt = min(samples)
         avg_rtt = sum(samples) / len(samples)
-        jitter = abs(samples[0] - samples[1]) if len(samples) > 1 else 0.8
+        jitter = (max(samples) - min(samples)) if len(samples) > 1 else 0.8
         tier = classify_tier(min_rtt, alive=True)
         spark = make_sparkline(samples)
 
@@ -757,6 +1635,8 @@ async def check_node_advanced(
             avg_latency_ms=round(avg_rtt, 1),
             jitter_ms=round(jitter, 1),
             tls_ok=tls_success,
+            sni_ok=sni_ok,
+            tls_detail=tls_detail,
             country_code=code,
             country_flag=flag,
             country_name=ru_name,
@@ -814,8 +1694,9 @@ async def benchmark_nodes(
     configs: Sequence[ParsedConfig],
     concurrency: int = 48,
     progress_callback: Callable[[int, int, NodeCheckResult], None] | None = None,
+    timeout: float = 2.5,
 ) -> list[NodeCheckResult]:
-    """Run concurrent benchmark across multiple configs, sorted by latency."""
+    """Run concurrent benchmark across multiple configs, sorted by TLS validity & latency."""
     sem = asyncio.Semaphore(concurrency)
     results: list[NodeCheckResult] = []
     total = len(configs)
@@ -824,7 +1705,7 @@ async def benchmark_nodes(
     async def worker(cfg: ParsedConfig) -> None:
         nonlocal completed
         async with sem:
-            res = await check_node_advanced(cfg)
+            res = await check_node_advanced(cfg, timeout=timeout)
             results.append(res)
             completed += 1
             if progress_callback:
@@ -834,8 +1715,15 @@ async def benchmark_nodes(
     if tasks:
         await asyncio.gather(*tasks)
 
-    # Sort: Alive first, VLESS/Trojan before Hysteria, then by lowest latency ms
-    results.sort(key=lambda r: (not r.alive, r.config.protocol == "hysteria2", r.latency_ms))
+    # Sort: Alive first, TLS/SNI-verified first, VLESS/Trojan before Hysteria2, then lowest latency ms
+    results.sort(
+        key=lambda r: (
+            not r.alive,
+            not r.tls_ok,
+            r.config.protocol == "hysteria2",
+            r.latency_ms,
+        )
+    )
     return results
 
 
@@ -908,6 +1796,7 @@ def build_health_report(results: list[NodeCheckResult]) -> dict:
     # Security breakdown
     reality_alive = sum(1 for r in alive if "reality" in (r.config.security or "").lower())
     tls_alive = sum(1 for r in alive if (r.config.security or "").lower() == "tls")
+    tls_verified = sum(1 for r in alive if r.tls_ok)
     http_verified = sum(1 for r in alive if r.http_ok)
 
     return {
@@ -920,6 +1809,7 @@ def build_health_report(results: list[NodeCheckResult]) -> dict:
         "min_ping_ms": min_ping,
         "max_ping_ms": max_ping,
         "avg_jitter_ms": avg_jitter,
+        "tls_verified": tls_verified,
         "http_verified": http_verified,
         "tiers": {
             "ultra": ultra_count,
@@ -954,9 +1844,11 @@ def build_health_report(results: list[NodeCheckResult]) -> dict:
                 "remark": r.config.remark[:32],
                 "raw_url": r.config.raw_url,
                 "tls_ok": r.tls_ok,
+                "tls_detail": r.tls_detail,
                 "http_ok": r.http_ok,
                 "http_delay_ms": r.http_delay_ms,
                 "http_probe_msg": r.http_probe_msg,
+                "speed_mbps": r.speed_mbps,
             }
             for r in alive[:15]
         ],

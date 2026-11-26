@@ -352,14 +352,29 @@ class TestProtocolParsing(unittest.TestCase):
 
     def test_vless_rejections(self):
         from protocols import parse_vless_url
+        from checker import build_sing_box_outbound, build_xray_outbound
+        from protocols import ParsedConfig
 
         # Invalid port
         self.assertIsNone(parse_vless_url("vless://user@host:0"))
         self.assertIsNone(parse_vless_url("vless://user@host:99999"))
-        # Iranian host
+        # Iranian host & Iranian SNI
         self.assertIsNone(parse_vless_url("vless://98765432-1234-1234-1234-123456789abc@server.ir:443"))
-        # Spam query filter
+        self.assertIsNone(parse_vless_url("vless://98765432-1234-1234-1234-123456789abc@1.2.3.4:443?security=tls&sni=node.soft10.ir"))
+        # Truncated / corrupt transport (e.g. ellipsis '…')
+        self.assertIsNone(parse_vless_url("vless://98765432-1234-1234-1234-123456789abc@1.2.3.4:443?type=…&security=reality&pbk=abc"))
+        # Spam query filter (case-insensitive)
         self.assertIsNone(parse_vless_url("vless://98765432-1234-1234-1234-123456789abc@server.com:443?fear_config=1"))
+        self.assertIsNone(parse_vless_url("vless://98765432-1234-1234-1234-123456789abc@server.com:443?path=/?VPsave"))
+        # Outbound builder guards against unknown transport
+        bad_cfg = ParsedConfig(
+            protocol="vless", uuid="u1", host="1.2.3.4", port=443,
+            remark="bad", security="reality", network_type="…", path="",
+            host_header="", sni="s.com", alpn="", fingerprint="chrome",
+            public_key="abc", short_id="", raw_url="vless://...",
+        )
+        self.assertIsNone(build_sing_box_outbound(bad_cfg))
+        self.assertIsNone(build_xray_outbound(bad_cfg))
 
     def test_trojan_parsing(self):
         from protocols import parse_trojan_url
@@ -487,6 +502,32 @@ class TestDeduplicationAndNormalization(unittest.TestCase):
         self.assertEqual(lte[0].uuid, "u1")
         self.assertEqual(len(wifi), 1)
         self.assertEqual(wifi[0].uuid, "u2")
+
+    def test_select_diverse_fastest_limits_cluster(self):
+        from refresh_vless_repo import select_diverse_fastest
+        from protocols import ParsedConfig
+
+        cfgs = [
+            ParsedConfig(
+                protocol="vless", uuid="sameuuid12345678", host=f"198.51.100.{i}", port=443,
+                remark="Germany", security="reality", network_type="tcp", path="",
+                host_header="", sni="s.com", alpn="", fingerprint="chrome",
+                public_key="abc", short_id="", raw_url=f"vless://u@198.51.100.{i}:443",
+            )
+            for i in range(1, 7)
+        ] + [
+            ParsedConfig(
+                protocol="vless", uuid="otheruuid1234567", host="203.0.113.10", port=443,
+                remark="Netherlands", security="reality", network_type="tcp", path="",
+                host_header="", sni="n.com", alpn="", fingerprint="chrome",
+                public_key="abc", short_id="", raw_url="vless://u2@203.0.113.10:443",
+            )
+        ]
+        lats = {(c.protocol, c.host, c.port): 50.0 for c in cfgs}
+        picked = select_diverse_fastest(cfgs, lats, limit=3, max_per_cluster=2)
+        self.assertEqual(len(picked), 3)
+        hosts = [c.host for c in picked]
+        self.assertIn("203.0.113.10", hosts)
 
 
 class TestGitPublicationLogic(unittest.TestCase):

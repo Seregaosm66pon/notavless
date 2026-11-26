@@ -10,6 +10,7 @@ import asyncio
 import base64
 import http.client
 import logging
+import re
 import socket
 import ssl
 import subprocess
@@ -53,7 +54,17 @@ from contributors import (
     get_custom_nodes,
     read_sources_with_contributors,
 )
-from checker import classify_russian_tier, detect_country_info
+from checker import (
+    NodeCheckResult,
+    build_tls_client_hello,
+    classify_russian_tier,
+    classify_tier,
+    detect_country_info,
+    enrich_country_geoip_batch,
+    find_sing_box_executable,
+    find_xray_executable,
+    probe_nodes_http_batch,
+)
 from protocols import (
     ParsedConfig,
     ProxySourceError,
@@ -86,15 +97,15 @@ LTE_HINTS = (
     "ya.ru",
     "yastatic",
     "yandex.ru",
-    "max",
-    "vk",
     "vk.com",
+    "vk.me",
+    "okcdn",
+    "mycdn",
     "mail.ru",
     "mts",
     "beeline",
     "megafon",
     "tele2",
-    "t2",
     "sber",
     "sberbank",
     "tinkoff",
@@ -102,7 +113,7 @@ LTE_HINTS = (
     "tbank",
     "ozon",
     "wildberries",
-    "wb",
+    "wbbasket",
     "wb.ru",
     "rutube",
     "gosuslugi",
@@ -111,10 +122,11 @@ LTE_HINTS = (
     "avito",
     "beget",
     "selectel",
-    "x5",
+    "cloudconsole",
     "urent",
     "dns-shop",
 )
+_LTE_WORD_RE = re.compile(r"(?:^|[^a-z0-9])(vk|t2|x5|wb|max)(?:[^a-z0-9]|$)", re.IGNORECASE)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,7 +145,7 @@ def _build_config_key(cfg: ParsedConfig) -> tuple:
     return (
         cfg.protocol,
         cfg.uuid,
-        cfg.host,
+        cfg.host.lower(),
         cfg.port,
         cfg.network_type,
         cfg.security,
@@ -141,7 +153,6 @@ def _build_config_key(cfg: ParsedConfig) -> tuple:
         cfg.host_header,
         cfg.sni,
         cfg.alpn,
-        cfg.fingerprint,
         cfg.public_key,
         cfg.short_id,
     )
@@ -152,17 +163,25 @@ def telegram_source_enabled() -> bool:
 
 
 def dedupe_configs(configs: list[ParsedConfig], max_per_host_port: int = 2) -> list[ParsedConfig]:
-    seen: set[tuple] = set()
+    seen_idx: dict[tuple, int] = {}
     host_port_counts: dict[tuple[str, int], int] = {}
     deduped: list[ParsedConfig] = []
+    preferred_fps = {"chrome", "firefox", "edge", "safari", "ios", "android"}
+
     for cfg in configs:
         key = _build_config_key(cfg)
-        if key in seen:
+        if key in seen_idx:
+            # Prefer cleaner uTLS fingerprint over exotic/broken ones on exact duplicates
+            existing_pos = seen_idx[key]
+            existing_fp = (deduped[existing_pos].fingerprint or "").lower()
+            cand_fp = (cfg.fingerprint or "").lower()
+            if existing_fp not in preferred_fps and cand_fp in preferred_fps:
+                deduped[existing_pos] = cfg
             continue
         hp = (cfg.host.lower(), cfg.port)
         if host_port_counts.get(hp, 0) >= max_per_host_port:
             continue
-        seen.add(key)
+        seen_idx[key] = len(deduped)
         host_port_counts[hp] = host_port_counts.get(hp, 0) + 1
         deduped.append(cfg)
     return deduped
@@ -215,7 +234,9 @@ def is_lte_config(cfg: ParsedConfig) -> bool:
             cfg.raw_url,
         )
     ).lower()
-    return any(token in blob for token in LTE_HINTS)
+    if any(token in blob for token in LTE_HINTS):
+        return True
+    return bool(_LTE_WORD_RE.search(blob))
 
 
 def split_lte_wifi(configs: list[ParsedConfig]) -> tuple[list[ParsedConfig], list[ParsedConfig]]:
@@ -428,11 +449,17 @@ async def load_source_result() -> tuple[str, dict]:
             all_configs.append(parsed)
             total_candidates += 1
 
-    # Fetch remote URLs
-    for url, author in source_items:
+    # Fetch remote URLs concurrently
+    async def fetch_one(url: str, author: str):
         try:
             text = await download_proxy_source(url)
+            return url, author, text, None
         except Exception as exc:
+            return url, author, "", exc
+
+    fetched_items = await asyncio.gather(*(fetch_one(u, a) for u, a in source_items))
+    for url, author, text, exc in fetched_items:
+        if exc is not None:
             failed_sources += 1
             logger.warning("Failed to fetch %s: %s", url, _sanitize_error(str(exc)))
             continue
@@ -485,10 +512,15 @@ async def check_udp_reachability(host: str, port: int, timeout: float = 2.5) -> 
         return False
 
 
-async def check_node(cfg: ParsedConfig, timeout: float = 2.5) -> tuple[bool, float]:
-    # 1. Hysteria 2: cannot be probed via raw UDP without sing-box; give high latency so it stays at bottom
+async def check_node(
+    cfg: ParsedConfig,
+    timeout: float = 2.5,
+    allow_reality_tcp: bool = False,
+) -> tuple[bool, float]:
+    # 1. Hysteria 2: verify DNS + UDP socket target reachability
     if cfg.protocol == "hysteria2":
-        return True, 999.0
+        udp_ok = await check_udp_reachability(cfg.host, cfg.port, timeout=timeout)
+        return (True, 999.0) if udp_ok else (False, 9999.0)
 
     # 2. Reject unencrypted VLESS / Trojan (security == 'none' or insecure HTTP ports 80, 8080, 8880, 2086, 2082)
     # These are blocked by Russian TSPU/RKN and fail URL test in Throne
@@ -502,18 +534,23 @@ async def check_node(cfg: ParsedConfig, timeout: float = 2.5) -> tuple[bool, flo
     if any(b in blob for b in (".workers.dev", ".pages.dev", "workers.dev", "pages.dev")):
         return False, 9999.0
 
-    # 4. VLESS & Trojan: real TCP reachability & TLS protocol liveness check
+    # 4. VLESS & Trojan: real TCP reachability & genuine TLS 1.3 ClientHello SNI probe
     t0 = time.perf_counter()
+    target_sni = cfg.sni or cfg.host
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(cfg.host, cfg.port),
             timeout=timeout,
         )
+        tcp_rtt = (time.perf_counter() - t0) * 1000.0
 
-        # Probe TLS handshake liveness (detect EOF or dead drop sockets)
-        writer.write(b"\x16\x03\x01\x00\x05\x01\x00\x00\x01\x00")
+        hello = build_tls_client_hello(target_sni)
+        writer.write(hello)
         await writer.drain()
-        data = await asyncio.wait_for(reader.read(1024), timeout=min(1.5, timeout * 0.7))
+        try:
+            data = await asyncio.wait_for(reader.read(64), timeout=min(2.0, timeout * 0.8))
+        except asyncio.TimeoutError:
+            data = None
         rtt = (time.perf_counter() - t0) * 1000.0
 
         writer.close()
@@ -522,19 +559,34 @@ async def check_node(cfg: ParsedConfig, timeout: float = 2.5) -> tuple[bool, flo
         except Exception:
             pass
 
-        # If server immediately closed with EOF (0 bytes) or hung, it's a dead socket / broken VLESS
-        if not data:
+        # Dead / zombie EOF / TSPU silent drop (timeout returns None, EOF returns b"")
+        if data == b"":
+            return False, 9999.0
+        if data is None:
+            # When Dual-Core HTTP probe is active, allow Reality TCP listeners through for real key verification
+            if allow_reality_tcp and cfg.security == "reality":
+                return True, round(tcp_rtt, 1)
             return False, 9999.0
 
-        # 5. For standard TLS (not Reality), verify TLS certificate handshake if SNI is available
-        if cfg.security == "tls" and cfg.sni:
+        # ServerHello (0x16 0x03) -> SNI and TLS stack verified in one RTT
+        if data.startswith(b"\x16\x03"):
+            return True, round(rtt, 1)
+
+        # For Reality: TLS Alert (0x15 0x03) indicates live TLS responder (not DPI drop)
+        if cfg.security == "reality":
+            if data.startswith(b"\x15\x03"):
+                return True, round(rtt, 1)
+            return False, 9999.0
+
+        # For standard TLS: fallback SSL handshake check if ServerHello wasn't returned directly
+        if cfg.security == "tls" and target_sni:
             try:
                 ssl_ctx = ssl.create_default_context()
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
                 t1 = time.perf_counter()
                 r2, w2 = await asyncio.wait_for(
-                    asyncio.open_connection(cfg.host, cfg.port, ssl=ssl_ctx, server_hostname=cfg.sni),
+                    asyncio.open_connection(cfg.host, cfg.port, ssl=ssl_ctx, server_hostname=target_sni),
                     timeout=max(1.5, timeout * 0.7),
                 )
                 tls_rtt = (time.perf_counter() - t1) * 1000.0
@@ -547,7 +599,7 @@ async def check_node(cfg: ParsedConfig, timeout: float = 2.5) -> tuple[bool, flo
             except Exception:
                 return False, 9999.0
 
-        return True, round(rtt, 1)
+        return False, 9999.0
     except Exception:
         return False, 9999.0
 
@@ -593,20 +645,23 @@ async def check_url_test(target_url: str, timeout: float = 5.0) -> bool:
         return False
 
 
-async def filter_reachable_configs(configs: list[ParsedConfig]) -> tuple[list[ParsedConfig], int, dict[tuple[str, str, int], float], list[float]]:
+async def filter_reachable_configs(
+    configs: list[ParsedConfig],
+    allow_reality_tcp: bool = False,
+) -> tuple[list[ParsedConfig], int, dict[tuple[str, str, int], float], list[float]]:
     ok: list[tuple[ParsedConfig, float]] = []
     failed = 0
     sem = asyncio.Semaphore(CHECK_CONCURRENCY)
-    host_cache: dict[tuple[str, str, int], tuple[bool, float]] = {}
+    host_cache: dict[tuple[str, str, int, str, str], tuple[bool, float]] = {}
 
     async def check(cfg: ParsedConfig) -> None:
         nonlocal failed
-        key = (cfg.protocol, cfg.host, cfg.port)
+        key = (cfg.protocol, cfg.host, cfg.port, cfg.security, cfg.sni)
         async with sem:
             if key in host_cache:
                 alive, lat = host_cache[key]
             else:
-                alive, lat = await check_node(cfg, timeout=CHECK_TIMEOUT)
+                alive, lat = await check_node(cfg, timeout=CHECK_TIMEOUT, allow_reality_tcp=allow_reality_tcp)
                 host_cache[key] = (alive, lat)
         if alive:
             ok.append((cfg, lat))
@@ -617,9 +672,57 @@ async def filter_reachable_configs(configs: list[ParsedConfig]) -> tuple[list[Pa
     # Sort by lowest latency
     ok.sort(key=lambda item: item[1])
     sorted_configs = [cfg for cfg, _ in ok]
-    latencies_map = {(cfg.protocol, cfg.host, cfg.port): lat for cfg, lat in ok}
+    latencies_map: dict[tuple[str, str, int], float] = {}
+    for cfg, lat in ok:
+        hp_key = (cfg.protocol, cfg.host, cfg.port)
+        if hp_key not in latencies_map or lat < latencies_map[hp_key]:
+            latencies_map[hp_key] = lat
     latencies_list = [lat for _, lat in ok if lat < 900.0]
     return sorted_configs, failed, latencies_map, latencies_list
+
+
+def select_diverse_fastest(
+    configs: list[ParsedConfig],
+    latencies_map: dict[tuple[str, str, int], float],
+    limit: int = 100,
+    max_per_cluster: int = 2,
+) -> list[ParsedConfig]:
+    """Select top-N fastest configs while preventing one UUID/subnet farm from dominating."""
+    def _cluster_key(c: ParsedConfig) -> tuple[str, str]:
+        parts = c.host.split(".")
+        subnet = ".".join(parts[:3]) if len(parts) == 4 and all(p.isdigit() for p in parts) else c.host.lower()
+        return (c.uuid[:16], subnet)
+
+    def _filter_pass(max_lat: float, require_country: bool) -> list[ParsedConfig]:
+        picked: list[ParsedConfig] = []
+        overflow: list[ParsedConfig] = []
+        counts: dict[tuple[str, str], int] = {}
+        for c in configs:
+            lat = latencies_map.get((c.protocol, c.host, c.port), 9999.0)
+            if lat >= max_lat:
+                continue
+            if require_country and detect_country_info(c.remark, c.host, c.sni)[2] == "Сервер":
+                continue
+            ck = _cluster_key(c)
+            if counts.get(ck, 0) < max_per_cluster:
+                picked.append(c)
+                counts[ck] = counts.get(ck, 0) + 1
+            else:
+                overflow.append(c)
+            if len(picked) >= limit:
+                return picked
+        for c in overflow:
+            if len(picked) >= limit:
+                break
+            picked.append(c)
+        return picked
+
+    pool = _filter_pass(250.0, require_country=True)
+    if len(pool) < 50:
+        pool = _filter_pass(450.0, require_country=True)
+    if len(pool) < 30:
+        pool = _filter_pass(600.0, require_country=False)
+    return pool[:limit] if pool else configs[:limit]
 
 
 async def run_update_pipeline() -> dict:
@@ -630,10 +733,82 @@ async def run_update_pipeline() -> dict:
     if not url_test_ok:
         logger.warning("URL test target is not reachable: %s", URL_TEST_TARGET)
 
-    reachable, connect_failed, latencies_map, latencies = await filter_reachable_configs(deduped)
+    has_core = bool(find_sing_box_executable() or find_xray_executable())
+    reachable, connect_failed, latencies_map, latencies = await filter_reachable_configs(
+        deduped, allow_reality_tcp=has_core
+    )
 
-    # Segregate by protocol and sort by lowest latency with Reality:443 preference
-    def vless_pref(c: ParsedConfig) -> tuple[int, int, float]:
+    # Enrich unknown IP countries via fast batch GeoIP so nodes get accurate flags instead of "Сервер"
+    unknown_hosts = [
+        c.host for c in reachable
+        if detect_country_info(c.remark, c.host, c.sni)[2] == "Сервер"
+    ]
+    if unknown_hosts:
+        await asyncio.to_thread(enrich_country_geoip_batch, unknown_hosts, 2.5)
+
+    # Real Dual-Core HTTP 204 proxy verification when sing-box/Xray is installed (CI or local)
+    http_verified_keys: set[tuple] = set()
+    http_failed_keys: set[tuple] = set()
+    if has_core and reachable:
+        probe_candidates = [c for c in reachable if c.protocol in ("vless", "trojan")]
+        # Probe Reality candidates and fastest TLS nodes first (up to 240 nodes cleanly in ~8s)
+        probe_candidates.sort(key=lambda c: (0 if c.security == "reality" else 1, latencies_map.get((c.protocol, c.host, c.port), 999.0)))
+        probe_subset = probe_candidates[:240]
+        probe_items: list[NodeCheckResult] = []
+        for c in probe_subset:
+            code, flag, ru_name = detect_country_info(c.remark, c.host, c.sni)
+            lat = latencies_map.get((c.protocol, c.host, c.port), 999.0)
+            probe_items.append(
+                NodeCheckResult(
+                    config=c,
+                    alive=True,
+                    latency_ms=lat,
+                    tls_ok=True,
+                    country_code=code,
+                    country_flag=flag,
+                    country_name=ru_name,
+                    quality_tier=classify_tier(lat, True),
+                )
+            )
+        probed = await probe_nodes_http_batch(
+            probe_items,
+            top_n=len(probe_items),
+            concurrency=28,
+            timeout=4.5,
+            smart_select=False,
+        )
+        probed_keys = {_build_config_key(c) for c in probe_subset}
+        for r in probed:
+            k = _build_config_key(r.config)
+            if r.http_ok:
+                http_verified_keys.add(k)
+                latencies_map[(r.config.protocol, r.config.host, r.config.port)] = r.http_delay_ms
+            else:
+                http_failed_keys.add(k)
+        logger.info(
+            "Dual-Core HTTP 204 audit: probed=%d passed=%d failed=%d",
+            len(probe_items),
+            len(http_verified_keys),
+            len(http_failed_keys),
+        )
+        if len(http_verified_keys) >= 10:
+            # Drop every node that was tested via core and failed HTTP 204 transit
+            reachable = [
+                c for c in reachable
+                if _build_config_key(c) in http_verified_keys
+                or c.protocol == "hysteria2"
+                or _build_config_key(c) not in probed_keys
+            ]
+            latencies = [
+                latencies_map[(c.protocol, c.host, c.port)]
+                for c in reachable
+                if c.protocol != "hysteria2" and (c.protocol, c.host, c.port) in latencies_map
+            ]
+
+    # Segregate by protocol and sort by HTTP verification + lowest latency + Reality:443 preference
+    def vless_pref(c: ParsedConfig) -> tuple[int, int, int, float]:
+        k = _build_config_key(c)
+        http_tier = 0 if k in http_verified_keys else (2 if k in http_failed_keys else 1)
         lat = latencies_map.get((c.protocol, c.host, c.port), 9999.0)
         _, _, country_name = detect_country_info(c.remark, c.host, c.sni)
         # Known country preferred over generic "Сервер"
@@ -650,12 +825,12 @@ async def run_update_pipeline() -> dict:
             sec_tier = 2
         else:
             sec_tier = 3
-        return (country_tier, sec_tier, lat)
+        return (http_tier, country_tier, sec_tier, lat)
 
     vless_configs = sorted([c for c in reachable if c.protocol == "vless"], key=vless_pref)
     trojan_configs = sorted(
         [c for c in reachable if c.protocol == "trojan"],
-        key=lambda c: latencies_map.get((c.protocol, c.host, c.port), 9999.0),
+        key=lambda c: (0 if _build_config_key(c) in http_verified_keys else 1, latencies_map.get((c.protocol, c.host, c.port), 9999.0)),
     )
     hy2_configs = sorted(
         [c for c in reachable if c.protocol == "hysteria2"],
@@ -666,19 +841,13 @@ async def run_update_pipeline() -> dict:
     mega_ordered = vless_configs + trojan_configs + hy2_configs
     mega_urls = normalize_urls(mega_ordered, latencies_map)
 
-    # Fastest Top 100: ONLY verified working VLESS and Trojan nodes with identified countries (<250ms)!
-    fastest_pool = [
-        c for c in (vless_configs + trojan_configs)
-        if latencies_map.get((c.protocol, c.host, c.port), 9999.0) < 250.0
-        and detect_country_info(c.remark, c.host, c.sni)[2] != "Сервер"
-    ]
-    if len(fastest_pool) < 50:
-        fastest_pool = [
-            c for c in (vless_configs + trojan_configs)
-            if latencies_map.get((c.protocol, c.host, c.port), 9999.0) < 450.0
-            and detect_country_info(c.remark, c.host, c.sni)[2] != "Сервер"
-        ]
-    fastest_configs = fastest_pool[:100] if fastest_pool else (vless_configs[:100])
+    # Fastest Top 100: prioritize strictly HTTP-204-verified nodes when available!
+    fastest_candidates = (
+        [c for c in (vless_configs + trojan_configs) if _build_config_key(c) in http_verified_keys]
+        if len(http_verified_keys) >= 5
+        else (vless_configs + trojan_configs)
+    )
+    fastest_configs = select_diverse_fastest(fastest_candidates, latencies_map, limit=100)
     fastest_urls = normalize_urls(fastest_configs, latencies_map)
 
     # Segregate by network type (LTE vs WiFi) using ordered configs

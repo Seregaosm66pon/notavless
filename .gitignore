@@ -212,3 +212,9 @@ __marimo__/
 *.sessions
 *.log
 temp/
+daemon.pid
+daemon_status.json
+audit_report.json
+local_fastest.txt
+local_fastest_base64.txt
+.geoip_cache.json

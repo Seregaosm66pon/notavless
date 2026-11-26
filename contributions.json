@@ -1,12 +1,11 @@
 {
   "version": 1,
-  "updated_at": "2026-11-22T11:30:05.305854",
+  "updated_at": "2026-11-25T23:52:31.116854",
   "contributors": {
     "@igareck": 6,
     "@aviamasters": 3,
-    "@zieng2": 1,
-    "@prominbro": 1,
-    "@testuser": 1
+    "@zieng2": 2,
+    "@prominbro": 1
   },
   "sources": [
     {
@@ -58,7 +57,7 @@
       "note": ""
     },
     {
-      "url": "https://raw.githubusercontent.com/zieng2/wl/main/vless_lite.txt",
+      "url": "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt",
       "added_by": "@zieng2",
       "added_at": "2026-11-15 12:07:32",
       "note": ""
@@ -74,14 +73,13 @@
       "added_by": "@igareck",
       "added_at": "2026-11-22 11:30:05",
       "note": ""
+    },
+    {
+      "url": "https://raw.githubusercontent.com/zieng2/wl/main/vless_lite.txt",
+      "added_by": "@zieng2",
+      "added_at": "2026-11-25 23:52:31",
+      "note": ""
     }
   ],
-  "custom_nodes": [
-    {
-      "raw_url": "trojan://password123@1.1.1.1:443?security=tls&sni=cloudflare.com#MyCustomTrojan",
-      "added_by": "@testuser",
-      "added_at": "2026-11-15 12:09:54",
-      "note": "Fast CDN Trojan"
-    }
-  ]
+  "custom_nodes": []
 }

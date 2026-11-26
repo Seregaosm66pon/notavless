@@ -9,4 +9,5 @@ https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLES
 https://raw.githubusercontent.com/aviamastersgh/vpn-free-russia/main/ru_configs.txt # added_by: @aviamasters
 https://raw.githubusercontent.com/aviamastersgh/vpn-free-russia/main/verified_configs.txt # added_by: @aviamasters
 https://raw.githubusercontent.com/zieng2/wl/main/vless_lite.txt # added_by: @zieng2
+https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt # added_by: @zieng2
 https://raw.githubusercontent.com/prominbro/sub/refs/heads/main/212.txt # added_by: @prominbro
