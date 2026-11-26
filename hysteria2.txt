@@ -4,7 +4,8 @@
 #announce: Nota Vless - тело в дело!
 #subscription-userinfo: upload=0; download=0; total=0; expire=0
 
-#generated-at: 2026-11-25 17:04:15
+#generated-at: 2026-11-26 01:17:40
+hysteria2://7316d881-eeec-429b-94f1-07585747f7c8@ru2.streamclubz.com:443/?sni=ru2.streamclubz.com#%5B%D0%91%D0%B0%D0%B7%D0%BE%D0%B2%D1%8B%D0%B9%5D%20%D0%A0%D0%BE%D1%81%D1%81%D0%B8%D1%8F%20%231%20NOTAVLESS
 hysteria2://48818046-00b5-4576-bbe8-d2971fe0f844@201.24.117.111:443?insecure=1#%5B%D0%91%D0%B0%D0%B7%D0%BE%D0%B2%D1%8B%D0%B9%5D%20%D0%93%D0%B5%D1%80%D0%BC%D0%B0%D0%BD%D0%B8%D1%8F%20%231%20NOTAVLESS
 hysteria2://48818046-00b5-4576-bbe8-d2971fe0f844@timeweb-2hmq5ehr3ievlnabv8l2.concept7.ru:443?insecure=1&pinSHA256=bf7bebeecc1878789d73090588553cc51b17fb3b64bcefb1a39f26426ac43281&security=tls&sni=hysteria-gjrao4f1.concept7.ru#%5B%D0%91%D0%B0%D0%B7%D0%BE%D0%B2%D1%8B%D0%B9%5D%20%D0%9D%D0%B8%D0%B4%D0%B5%D1%80%D0%BB%D0%B0%D0%BD%D0%B4%D1%8B%20%231%20NOTAVLESS
-hysteria2://3f63c86c-ac4a-4900-85cf-4fedf93c2ca5@91.240.86.70:22443?sni=hy.quattro-tech.ru&insecure=0&allowInsecure=0#%5B%D0%91%D0%B0%D0%B7%D0%BE%D0%B2%D1%8B%D0%B9%5D%20%D0%A0%D0%BE%D1%81%D1%81%D0%B8%D1%8F%20%231%20NOTAVLESS
+hysteria2://3f63c86c-ac4a-4900-85cf-4fedf93c2ca5@91.240.86.70:22443?sni=hy.quattro-tech.ru&insecure=0&allowInsecure=0#%5B%D0%91%D0%B0%D0%B7%D0%BE%D0%B2%D1%8B%D0%B9%5D%20%D0%A0%D0%BE%D1%81%D1%81%D0%B8%D1%8F%20%232%20NOTAVLESS
