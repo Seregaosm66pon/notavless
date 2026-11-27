@@ -4,7 +4,4 @@
 #announce: Nota Vless - тело в дело!
 #subscription-userinfo: upload=0; download=0; total=0; expire=0
 
-#generated-at: 2026-11-27 08:32:46
-trojan://gHQP0D7D15@172.67.118.45:2053?security=tls&insecure=0&type=ws&allowInsecure=0&sni=marvdasht.phonecomparisonblog.org#%5B%D0%91%D1%8B%D1%81%D1%82%D1%80%D1%8B%D0%B9%5D%20%D0%A4%D1%80%D0%B0%D0%BD%D1%86%D0%B8%D1%8F%20%231%20NOTAVLESS
-trojan://DfwnMKgFLmRES7Z-q2gdAhqMwuyuKLbJ@185.229.9.95:443?security=tls&sni=node251.overgroup.cloud&alpn=h2%2Chttp%2F1.1&fp=firefox#%5B%D0%91%D1%8B%D1%81%D1%82%D1%80%D1%8B%D0%B9%5D%20%D0%A1%D0%A8%D0%90%20%231%20NOTAVLESS
-trojan://1sUm9iYpsjLCOC9THsL9cg@ipfast.kingmna.com:443?pcs=CD6E838B9BFE31CAB8B3D5C858B0D6223FE84ECE236C1FDB281BE93C302E1E6E&path=/TELEGRAM-@NUFiLTER-TELEGRAM-@NUFiLTER-TELEGRAM-@NUFiLTER-TELEGRAM-@NUFiLTER-TELEGRAM-@NUFiLTER-TELEGRAM-@NUFiLTER-TELEGRAM-@NUFiLTER-TELEGRAM-@NUFiLTER&security=tls&insecure=0&host=filasi554.global.ssl.fastly.net.&type=ws&allowInsecure=0&sni=cdn.akamai.steamstatic.com#%5B%D0%A1%D1%82%D0%B0%D0%BD%D0%B4%D0%B0%D1%80%D1%82%5D%20%D0%A1%D0%B5%D1%80%D0%B2%D0%B5%D1%80%20%231%20NOTAVLESS
+#generated-at: 2026-11-27 10:32:46
