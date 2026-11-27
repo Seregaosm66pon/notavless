@@ -4,6 +4,6 @@
 #announce: Nota Vless - тело в дело!
 #subscription-userinfo: upload=0; download=0; total=0; expire=0
 
-#generated-at: 2026-11-27 10:32:46
-hysteria2://db0eb9c9-5bb5-4a59-ba56-a33bc8e0de5d@84.23.52.100:443?sni=84-23-52-100.sslip.io&alpn=h3#%5B%D0%91%D0%B0%D0%B7%D0%BE%D0%B2%D1%8B%D0%B9%5D%20%D0%A8%D0%B2%D0%B5%D1%86%D0%B8%D1%8F%20%231%20NOTAVLESS
+#generated-at: 2026-11-27 12:32:38
+hysteria2://216c50f9-37dc-457d-b3f5-90732791d10d@45.86.74.193:443?sni=media.embrofree.org#%5B%D0%91%D0%B0%D0%B7%D0%BE%D0%B2%D1%8B%D0%B9%5D%20%D0%91%D1%80%D0%B0%D0%B7%D0%B8%D0%BB%D0%B8%D1%8F%20%231%20NOTAVLESS
 hysteria2://3f63c86c-ac4a-4900-85cf-4fedf93c2ca5@91.240.86.70:22443?sni=hy.quattro-tech.ru&insecure=0&allowInsecure=0#%5B%D0%91%D0%B0%D0%B7%D0%BE%D0%B2%D1%8B%D0%B9%5D%20%D0%A0%D0%BE%D1%81%D1%81%D0%B8%D1%8F%20%231%20NOTAVLESS
