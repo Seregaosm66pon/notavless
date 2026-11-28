@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import http.client
+import json
 import logging
+import os
 import re
 import socket
 import ssl
@@ -400,7 +402,64 @@ async def send_notification(message_text: str) -> None:
         logger.warning("Notify task failed: %s", _sanitize_error(str(exc)))
 
 
-async def load_source_result() -> tuple[str, dict]:
+SOURCE_HEALTH_FILE = REPO_ROOT / ".source_health.json"
+
+
+def _select_sources_for_run(
+    source_items: list[tuple[str, str]],
+    max_bulk_per_run: int | None = None,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """
+    Partition sources into always-fetched priority RU lists and rotating bulk @RKP_channel pool
+    so 8,900+ URLs mine fresh configs cleanly in ~15s per run without stalling CI.
+    """
+    if max_bulk_per_run is None:
+        raw_env = (os.environ.get("MAX_RKP_SOURCES", "") or "").strip()
+        max_bulk_per_run = int(raw_env) if raw_env.isdigit() else 90
+
+    priority: list[tuple[str, str]] = []
+    bulk: list[tuple[str, str]] = []
+    for url, author in source_items:
+        if author.lower() == "@rkp_channel" and "raw.githubusercontent.com/rkpchannel" not in url.lower():
+            bulk.append((url, author))
+        else:
+            priority.append((url, author))
+
+    if max_bulk_per_run <= 0 or len(bulk) <= max_bulk_per_run:
+        return priority, bulk
+
+    # Load previous good/dead bulk URL stats so yielding endpoints stay prioritized
+    good_urls: list[tuple[str, str]] = []
+    dead_set: set[str] = set()
+    try:
+        if SOURCE_HEALTH_FILE.exists():
+            health = json.loads(SOURCE_HEALTH_FILE.read_text(encoding="utf-8"))
+            if isinstance(health, dict):
+                now = time.time()
+                good_set = set(health.get("good", []))
+                for u, ts in health.get("dead", {}).items():
+                    if now - float(ts) < 3 * 86400:
+                        dead_set.add(u)
+                good_urls = [(u, a) for u, a in bulk if u in good_set][:35]
+    except Exception:
+        pass
+
+    good_u_set = {u for u, _ in good_urls}
+    remaining = [(u, a) for u, a in bulk if u not in good_u_set and u not in dead_set]
+    if not remaining:
+        remaining = [(u, a) for u, a in bulk if u not in good_u_set]
+
+    slot_size = max(1, max_bulk_per_run - len(good_urls))
+    slot_idx = int(time.time() // 7200)
+    start = (slot_idx * slot_size) % len(remaining)
+    rotated = remaining[start:start + slot_size]
+    if len(rotated) < slot_size:
+        rotated.extend(remaining[: slot_size - len(rotated)])
+
+    return priority, good_urls + rotated
+
+
+async def load_source_result(max_bulk_per_run: int | None = None) -> tuple[str, dict]:
     # 1. Parse Telegram channels if configured
     if telegram_source_enabled():
         try:
@@ -434,6 +493,15 @@ async def load_source_result() -> tuple[str, dict]:
     if not source_items and not get_custom_nodes():
         raise ProxySourceError("No sources or nodes configured.")
 
+    priority_items, bulk_items = _select_sources_for_run(source_items, max_bulk_per_run=max_bulk_per_run)
+    active_items = priority_items + bulk_items
+    logger.info(
+        "Source planner: total_configured=%d priority=%d rkp_rotating_batch=%d",
+        len(source_items),
+        len(priority_items),
+        len(bulk_items),
+    )
+
     all_configs: list[ParsedConfig] = []
     total_candidates = 0
     skipped_count = 0
@@ -449,28 +517,71 @@ async def load_source_result() -> tuple[str, dict]:
             all_configs.append(parsed)
             total_candidates += 1
 
-    # Fetch remote URLs concurrently
-    async def fetch_one(url: str, author: str):
-        try:
-            text = await download_proxy_source(url)
-            return url, author, text, None
-        except Exception as exc:
-            return url, author, "", exc
+    # Bounded concurrency fetch: reliable timeout for priority lists, fast single-shot for bulk archive
+    fetch_sem = asyncio.Semaphore(60)
+    priority_url_set = {u for u, _ in priority_items}
 
-    fetched_items = await asyncio.gather(*(fetch_one(u, a) for u, a in source_items))
-    for url, author, text, exc in fetched_items:
+    async def fetch_one(url: str, author: str):
+        is_prio = url in priority_url_set
+        async with fetch_sem:
+            try:
+                text = await download_proxy_source(
+                    url,
+                    timeout=10 if is_prio else 4,
+                    retries=1 if is_prio else 0,
+                )
+                return url, author, text, is_prio, None
+            except Exception as exc:
+                return url, author, "", is_prio, exc
+
+    fetched_items = await asyncio.gather(*(fetch_one(u, a) for u, a in active_items))
+    bulk_good: list[str] = []
+    bulk_dead: list[str] = []
+
+    for url, author, text, is_prio, exc in fetched_items:
         if exc is not None:
             failed_sources += 1
-            logger.warning("Failed to fetch %s: %s", url, _sanitize_error(str(exc)))
+            if is_prio:
+                logger.warning("Failed to fetch %s: %s", url, _sanitize_error(str(exc)))
+            else:
+                bulk_dead.append(url)
             continue
 
         parsed = parse_proxy_source(text, added_by=author)
         total_candidates += parsed["total_candidates"]
         skipped_count += parsed["skipped_count"]
-        all_configs.extend(parsed["valid_configs"])
-        logger.info("Fetched %s: valid=%d candidates=%d", url, parsed["valid_count"], parsed["total_candidates"])
+        # Prevent any single giant spam dump from overwhelming probe budget
+        valid_cfgs = parsed["valid_configs"][: (450 if is_prio else 120)]
+        all_configs.extend(valid_cfgs)
+        if is_prio:
+            logger.info("Fetched %s: valid=%d candidates=%d", url, parsed["valid_count"], parsed["total_candidates"])
+        elif valid_cfgs:
+            bulk_good.append(url)
 
-    if not all_configs and failed_sources == len(source_items):
+    # Update rolling bulk source health cache cleanly
+    if bulk_items:
+        try:
+            old_health = json.loads(SOURCE_HEALTH_FILE.read_text(encoding="utf-8")) if SOURCE_HEALTH_FILE.exists() else {}
+            if not isinstance(old_health, dict):
+                old_health = {}
+            good_hist = [u for u in old_health.get("good", []) if u not in bulk_dead]
+            for u in bulk_good:
+                if u not in good_hist:
+                    good_hist.append(u)
+            dead_map = dict(old_health.get("dead", {}))
+            now_ts = time.time()
+            for u in bulk_dead:
+                dead_map[u] = now_ts
+            for u in bulk_good:
+                dead_map.pop(u, None)
+            SOURCE_HEALTH_FILE.write_text(
+                json.dumps({"good": good_hist[-150:], "dead": dead_map}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    if not all_configs and failed_sources == len(active_items):
         raise ProxySourceError("All sources failed to download.")
 
     return "urls", {
@@ -478,7 +589,7 @@ async def load_source_result() -> tuple[str, dict]:
         "valid_configs": all_configs,
         "valid_count": len(all_configs),
         "skipped_count": skipped_count,
-        "sources": [u for u, _ in source_items],
+        "sources": [u for u, _ in active_items],
         "failed_sources": failed_sources,
     }
 
@@ -728,6 +839,19 @@ def select_diverse_fastest(
 async def run_update_pipeline() -> dict:
     source_name, result = await load_source_result()
     deduped = dedupe_configs(result["valid_configs"])
+
+    # Prioritize curated Reality/non-RKP nodes first and cap raw TCP probe pool cleanly
+    raw_max_probe = (os.environ.get("MAX_PROBE_CANDIDATES", "") or "").strip()
+    max_probe = int(raw_max_probe) if raw_max_probe.isdigit() else 1200
+    if len(deduped) > max_probe > 0:
+        deduped.sort(
+            key=lambda c: (
+                1 if c.added_by == "@RKP_channel" else 0,
+                0 if (c.security == "reality" and c.port == 443) else (1 if c.security == "reality" else 2),
+                c.protocol == "hysteria2",
+            )
+        )
+        deduped = deduped[:max_probe]
 
     url_test_ok = await check_url_test(URL_TEST_TARGET)
     if not url_test_ok:

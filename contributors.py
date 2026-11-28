@@ -138,13 +138,27 @@ def read_sources_with_contributors(file_path: Path) -> list[tuple[str, str]]:
         return []
 
     results: list[tuple[str, str]] = []
-    lines = file_path.read_text(encoding="utf-8").splitlines()
+    lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    current_section_author = "@admin"
+
+    # Batch-update contributions once without O(N^2) rewrites on large 8k+ RKP source lists
+    bulk_mode = len(lines) > 250
+    data = load_contributions()
+    existing_urls = {item.get("url"): item for item in data["sources"] if item.get("url")}
+    contribs = data["contributors"]
+    contrib_changed = False
+
     for line in lines:
         cleaned = line.strip()
-        if not cleaned or cleaned.startswith("#"):
+        if not cleaned:
+            continue
+        if cleaned.startswith("#"):
+            hdr_match = ADDED_BY_RE.search(cleaned)
+            if hdr_match and "format:" not in cleaned.lower():
+                current_section_author = _normalize_username(hdr_match.group(1))
             continue
 
-        added_by = "@admin"
+        added_by = current_section_author
         if "#" in cleaned:
             parts = cleaned.split("#", 1)
             url_part = parts[0].strip()
@@ -154,9 +168,33 @@ def read_sources_with_contributors(file_path: Path) -> list[tuple[str, str]]:
                 added_by = _normalize_username(match.group(1))
             cleaned = url_part
 
-        if cleaned:
-            record_source(cleaned, added_by=added_by)
-            results.append((cleaned, added_by))
+        if not cleaned:
+            continue
+
+        results.append((cleaned, added_by))
+
+        if not bulk_mode:
+            if cleaned not in existing_urls:
+                entry = {
+                    "url": cleaned,
+                    "added_by": added_by,
+                    "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "note": "",
+                }
+                data["sources"].append(entry)
+                existing_urls[cleaned] = entry
+                contribs[added_by] = contribs.get(added_by, 0) + 1
+                contrib_changed = True
+            elif existing_urls[cleaned].get("added_by") != added_by and added_by != "@admin":
+                existing_urls[cleaned]["added_by"] = added_by
+                contrib_changed = True
+
+    if bulk_mode and "@RKP_channel" not in contribs:
+        contribs["@RKP_channel"] = sum(1 for _, a in results if a == "@RKP_channel") or len(results)
+        contrib_changed = True
+
+    if contrib_changed:
+        save_contributions(data)
 
     return results
 

@@ -33,10 +33,11 @@ from contributors import (
     record_source,
 )
 from checker import benchmark_nodes, build_health_report, check_node_advanced
-from protocols import parse_any_proxy_url
+from protocols import decrypt_or_extract_target, is_encrypted_sub_or_wrapper, parse_any_proxy_url
 from refresh_vless_repo import check_node, check_tcp_port, run_update_pipeline
 from tester import (
     execute_benchmark_interactive,
+    execute_encrypted_sub_test,
     main_interactive_menu,
     run_single_node_diagnostic,
 )
@@ -249,11 +250,11 @@ def cmd_stats(args: argparse.Namespace) -> None:
     print(f"\n[>] Universal config: {MEGA_SUBSCRIPTION_URL}\n")
 
 
-def cmd_test(args: argparse.Namespace) -> None:
+def cmd_decrypt(args: argparse.Namespace) -> None:
     target = getattr(args, "target", "").strip()
     if not target:
         try:
-            target = input("Введите ссылку (vless/trojan/hy2) или host:port: ").strip()
+            target = input("Введите happ://crypt*, incy://, v2raytun:// или https:// URL: ").strip()
         except (KeyboardInterrupt, EOFError):
             return
 
@@ -261,19 +262,79 @@ def cmd_test(args: argparse.Namespace) -> None:
         print("[-] Цель не указана.")
         return
 
-    asyncio.run(run_single_node_diagnostic(target))
+    run_test = getattr(args, "test", False) or getattr(args, "hardcore", False)
+    if run_test:
+        is_inter = sys.stdin.isatty()
+        asyncio.run(
+            execute_encrypted_sub_test(
+                target,
+                hardcore=True,
+                deep_http=True,
+                interactive=is_inter,
+            )
+        )
+        return
+
+    urls, resolved, err = decrypt_or_extract_target(target, timeout=10)
+    if err or not urls:
+        print(f"[-] Не удалось расшифровать/извлечь конфиги: {err}")
+        return
+
+    if resolved and resolved != target:
+        print(f"[+] Источник: {resolved}")
+    print(f"[+] Извлечено конфигов: {len(urls)}")
+    for u in urls[:30]:
+        print(u)
+    if len(urls) > 30:
+        print(f"... и еще {len(urls) - 30} шт.")
+
+
+def cmd_test(args: argparse.Namespace) -> None:
+    target = getattr(args, "target", "").strip()
+    if not target:
+        try:
+            target = input("Введите ссылку (vless/trojan/hy2/happ://crypt*) или host:port: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return
+
+    if not target:
+        print("[-] Цель не указана.")
+        return
+
+    if is_encrypted_sub_or_wrapper(target):
+        asyncio.run(execute_encrypted_sub_test(target, hardcore=True, interactive=sys.stdin.isatty()))
+    else:
+        asyncio.run(run_single_node_diagnostic(target))
 
 
 def cmd_benchmark(args: argparse.Namespace) -> None:
     limit = getattr(args, "limit", 0)
     all_flag = getattr(args, "all", False)
     deep_flag = getattr(args, "deep", False)
+    hardcore_flag = getattr(args, "hardcore", False)
+    speedtest_flag = getattr(args, "speedtest", False)
     non_interactive = getattr(args, "non_interactive", False)
     is_inter = not non_interactive and sys.stdin.isatty()
     if all_flag:
-        asyncio.run(execute_benchmark_interactive(limit=0, deep_http=deep_flag, interactive=is_inter))
-    elif limit > 0:
-        asyncio.run(execute_benchmark_interactive(limit=limit, deep_http=deep_flag, interactive=is_inter))
+        asyncio.run(
+            execute_benchmark_interactive(
+                limit=0,
+                deep_http=deep_flag or hardcore_flag,
+                interactive=is_inter,
+                speedtest=speedtest_flag,
+                hardcore=hardcore_flag,
+            )
+        )
+    elif limit > 0 or deep_flag or hardcore_flag or speedtest_flag:
+        asyncio.run(
+            execute_benchmark_interactive(
+                limit=limit or 80,
+                deep_http=deep_flag or hardcore_flag,
+                interactive=is_inter,
+                speedtest=speedtest_flag,
+                hardcore=hardcore_flag,
+            )
+        )
     else:
         main_interactive_menu()
 
@@ -442,13 +503,14 @@ def cmd_menu(args: argparse.Namespace | None = None) -> None:
         print(" 6. Посмотреть статистику и контрибьюторов (Stats)")
         print(" 7. Список активных источников (Sources)")
         print(" 8. Добавить свой узел или источник (Add)")
-        print(" 9. Проверка скорости и аудит пула (Benchmark / Speed Test)")
-        print(" 10. Настройки Telegram & Прокси (Config)")
-        print(" 11. Установить авто-обновление каждые 2ч в Планировщик Windows")
+        print(" 9. Проверка скорости и аудит пула (Benchmark / Speed Test / Жёсткий тест)")
+        print(" 10. Взломать сабку (Sub-Decrypter: happ://crypt*, incy://, v2raytun://)")
+        print(" 11. Настройки Telegram & Прокси (Config)")
+        print(" 12. Установить авто-обновление каждые 2ч в Планировщик Windows")
         print(" 0. Выход")
         print("===================================================")
         try:
-            choice = input("Выберите действие [0-11]: ").strip()
+            choice = input("Выберите действие [0-12]: ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nВыход.")
             break
@@ -485,9 +547,14 @@ def cmd_menu(args: argparse.Namespace | None = None) -> None:
             cmd_benchmark(argparse.Namespace())
             input("\nНажмите Enter для продолжения...")
         elif choice == "10":
-            cmd_config(argparse.Namespace())
+            sub_t = input("Вставьте happ://crypt*, incy://, v2raytun:// или URL: ").strip()
+            if sub_t:
+                cmd_decrypt(argparse.Namespace(target=sub_t, test=True, hardcore=True))
             input("\nНажмите Enter для продолжения...")
         elif choice == "11":
+            cmd_config(argparse.Namespace())
+            input("\nНажмите Enter для продолжения...")
+        elif choice == "12":
             subprocess.run([str(REPO_ROOT / "setup_task_scheduler.bat")], shell=True)
             input("\nНажмите Enter для продолжения...")
         elif choice in ("0", "q", "exit"):
@@ -540,21 +607,30 @@ def main() -> None:
     post_parser = subparsers.add_parser("post", help="Publish update message to Telegram channel immediately")
     post_parser.add_argument("--channel", default="", help="Target Telegram channel (e.g. @mychannel)")
 
-    # test
-    test_parser = subparsers.add_parser("test", help="Deep DPI & latency diagnostics of a node or host:port")
-    test_parser.add_argument("target", nargs="?", default="", help="Proxy URL or host:port")
+    # test / decrypt
+    test_parser = subparsers.add_parser("test", help="Deep DPI & latency diagnostics of a node, host:port or encrypted sub")
+    test_parser.add_argument("target", nargs="?", default="", help="Proxy URL, host:port, or happ://crypt*/URL")
+
+    decrypt_parser = subparsers.add_parser("decrypt", help="Decrypt happ://crypt*, incy://, v2raytun:// or sub URL (Sub-Decrypter)")
+    decrypt_parser.add_argument("target", nargs="?", default="", help="Encrypted subscription link or HTTP URL")
+    decrypt_parser.add_argument("--test", action="store_true", help="Benchmark decrypted configs after extraction")
+    decrypt_parser.add_argument("--hardcore", "--stress", action="store_true", help="Run hardcore stress test on decrypted configs")
 
     # benchmark / audit
     bench_parser = subparsers.add_parser("bench", help="Run interactive latency & DPI benchmark across nodes")
     bench_parser.add_argument("--limit", type=int, default=0, help="Max nodes to test in benchmark")
     bench_parser.add_argument("--all", action="store_true", help="Test all nodes from mega_sub.txt")
     bench_parser.add_argument("--deep", "--http-probe", action="store_true", help="Run Deep HTTP delay probe on top nodes")
+    bench_parser.add_argument("--hardcore", "--stress", action="store_true", help="Run hardcore torture test (3x Burst + Mbps + Exit IP + S+ Grade)")
+    bench_parser.add_argument("--speedtest", action="store_true", help="Also run Mbps speedtest on top verified nodes")
     bench_parser.add_argument("--non-interactive", "-y", action="store_true", help="Run non-interactively without menu prompts")
 
     audit_parser = subparsers.add_parser("audit", help="Run interactive latency & DPI benchmark across nodes")
     audit_parser.add_argument("--limit", type=int, default=0, help="Max nodes to test in benchmark")
     audit_parser.add_argument("--all", action="store_true", help="Test all nodes from mega_sub.txt")
     audit_parser.add_argument("--deep", "--http-probe", action="store_true", help="Run Deep HTTP delay probe on top nodes")
+    audit_parser.add_argument("--hardcore", "--stress", action="store_true", help="Run hardcore torture test (3x Burst + Mbps + Exit IP + S+ Grade)")
+    audit_parser.add_argument("--speedtest", action="store_true", help="Also run Mbps speedtest on top verified nodes")
     audit_parser.add_argument("--non-interactive", "-y", action="store_true", help="Run non-interactively without menu prompts")
 
     # config
@@ -570,6 +646,8 @@ def main() -> None:
         cmd_daemon(args)
     elif args.command in ("bench", "audit"):
         cmd_benchmark(args)
+    elif args.command == "decrypt":
+        cmd_decrypt(args)
     elif args.command == "post":
         cmd_post(args)
     elif args.command == "config":
@@ -588,7 +666,7 @@ def main() -> None:
         cmd_stats(args)
     elif args.command == "test":
         if not args.target:
-            target = input("Введите узел (vless/trojan/hy2) или host:port: ").strip()
+            target = input("Введите узел (vless/trojan/hy2/happ://crypt*) или host:port: ").strip()
             cmd_test(argparse.Namespace(target=target))
         else:
             cmd_test(args)

@@ -184,14 +184,56 @@ def sanitize_proxy_url(match_str: str) -> str:
 
 
 def extract_all_proxy_urls(text: str) -> list[str]:
-    text = html.unescape(text or "")
-    text = decode_maybe_base64(text)
+    raw_text = html.unescape(text or "")
+    dec = _get_sub_decrypter()
 
+    # Expand encrypted client keys (happ://crypt*, incy://crypt*, v2raytun://import*) if embedded
+    if dec is not None:
+        key_links = dec.find_key_links(raw_text)
+        if key_links:
+            expanded_chunks = [raw_text]
+            for klink in key_links[:8]:
+                try:
+                    kind, val = dec.resolve_key(klink)
+                    if kind == "text" and val:
+                        expanded_chunks.append(val)
+                    elif kind == "url" and val.lower().startswith(("http://", "https://")):
+                        try:
+                            expanded_chunks.append(_download_text_sync(val, timeout=6, retries=0))
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+            raw_text = "\n".join(expanded_chunks)
+
+    decoded = decode_maybe_base64(raw_text)
     urls: list[str] = []
-    for match in ANY_PROXY_URL_RE.findall(text):
+    seen_order: set[str] = set()
+
+    for match in ANY_PROXY_URL_RE.findall(decoded):
         cleaned = sanitize_proxy_url(match)
-        if cleaned:
+        if cleaned and cleaned not in seen_order:
+            seen_order.add(cleaned)
             urls.append(cleaned)
+
+    # Fallback: extract from Clash YAML / Sing-Box JSON / Xray JSON / nested Base64 via Sub-Decrypter
+    lower_raw = raw_text.lower()
+    if dec is not None and (
+        not urls
+        or "proxies:" in lower_raw
+        or '"outbounds"' in lower_raw
+        or '"outbound"' in lower_raw
+    ):
+        try:
+            extra_links = dec.extract_from_content(raw_text)
+            for link in extra_links:
+                cleaned = sanitize_proxy_url(link)
+                if cleaned and cleaned not in seen_order:
+                    seen_order.add(cleaned)
+                    urls.append(cleaned)
+        except Exception:
+            pass
+
     return urls
 
 
@@ -419,6 +461,97 @@ def parse_vless_source(text: str) -> dict[str, Any]:
     return parse_proxy_source(text)
 
 
+_SUB_DECRYPTER_CACHE: Any = None
+_SUB_DECRYPTER_INIT_TRIED = False
+
+
+def _get_sub_decrypter() -> Any:
+    """Lazy-load RKP Sub-Decrypter in silent in-memory mode (no disk side effects)."""
+    global _SUB_DECRYPTER_CACHE, _SUB_DECRYPTER_INIT_TRIED
+    if _SUB_DECRYPTER_INIT_TRIED:
+        return _SUB_DECRYPTER_CACHE
+    _SUB_DECRYPTER_INIT_TRIED = True
+    try:
+        import sub_decrypter
+
+        sub_decrypter.SETTINGS["verbose"] = False
+        sub_decrypter.SETTINGS["strip_config_names"] = False
+        sub_decrypter.SETTINGS["parse_html"] = False
+        sub_decrypter.SETTINGS["retries"] = 0
+        sub_decrypter.SETTINGS["timeout"] = 6
+        if not sub_decrypter.DEVICE.get("hwid"):
+            sub_decrypter.DEVICE.update(sub_decrypter.generate_device())
+        _SUB_DECRYPTER_CACHE = sub_decrypter
+    except Exception:
+        _SUB_DECRYPTER_CACHE = None
+    return _SUB_DECRYPTER_CACHE
+
+
+def is_encrypted_sub_or_wrapper(target: str) -> bool:
+    """Return True if target is an encrypted/wrapped client link (happ://, incy://, v2raytun://, sub://) or HTTP URL."""
+    t = (target or "").strip().lower()
+    return t.startswith(
+        (
+            "happ://",
+            "incy://",
+            "v2raytun://",
+            "sub://",
+            "clash://",
+            "v2box://",
+            "streisand://",
+            "hiddify://",
+            "http://",
+            "https://",
+        )
+    )
+
+
+def decrypt_or_extract_target(target_or_text: str, timeout: int = 8) -> tuple[list[str], str, str]:
+    """
+    Decrypt happ://crypt*, incy://crypt*, v2raytun://import*, unwrap client links/HTTP subs,
+    and extract raw proxy links (VLESS, Trojan, Hysteria 2) with full remark preservation.
+    Returns: (proxy_urls, resolved_source, error_msg)
+    """
+    raw = (target_or_text or "").strip()
+    if not raw:
+        return [], "", "Empty input"
+
+    dec = _get_sub_decrypter()
+    resolved_source = raw
+    content = raw
+
+    if dec is not None:
+        try:
+            klinks = dec.find_key_links(raw)
+            if klinks:
+                kind, val = dec.resolve_key(klinks[0])
+                resolved_source = val
+                if kind == "text":
+                    content = val
+                elif kind == "url" and val.lower().startswith(("http://", "https://")):
+                    content = _download_text_sync(val, timeout=timeout, retries=1)
+                else:
+                    content = val
+            else:
+                unwrapped = dec.unwrap_client_add(raw)
+                target_url = unwrapped or raw
+                if target_url.lower().startswith(("http://", "https://")):
+                    resolved_source = target_url
+                    content = _download_text_sync(target_url, timeout=timeout, retries=1)
+        except Exception as exc:
+            return [], resolved_source, str(exc)
+    elif raw.lower().startswith(("http://", "https://")):
+        try:
+            content = _download_text_sync(raw, timeout=timeout, retries=1)
+        except Exception as exc:
+            return [], resolved_source, str(exc)
+
+    urls = extract_all_proxy_urls(content)
+    if not urls:
+        return [], resolved_source, "No supported configs (vless/trojan/hy2) found"
+    return urls, resolved_source, ""
+
+
 def _download_text_sync(url: str, timeout: int = 20, retries: int = 2) -> str:
     import time
     import urllib.error
@@ -427,35 +560,48 @@ def _download_text_sync(url: str, timeout: int = 20, retries: int = 2) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ProxySourceError("Unsupported URL.")
 
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "Accept": "text/plain,text/html,application/json,*/*",
-        },
-    )
+    dec = _get_sub_decrypter()
+    hdrs = {
+        "User-Agent": (
+            dec.happ_user_agent()
+            if dec is not None
+            else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/plain,text/html,application/json,*/*",
+    }
+    if dec is not None:
+        hdrs.update(dec.device_headers())
+
+    max_bytes = 3 * 1024 * 1024
     last_exc: Exception | None = None
     attempts = max(1, retries + 1)
     for attempt in range(attempts):
+        use_headers = hdrs if attempt == 0 else {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+        }
+        req = urllib.request.Request(url, headers=use_headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 if response.status >= 400:
                     raise ProxySourceError(f"HTTP {response.status}")
                 charset = response.headers.get_content_charset() or "utf-8"
-                return response.read().decode(charset, errors="replace")
+                return response.read(max_bytes).decode(charset, errors="replace")
         except urllib.error.HTTPError as exc:
             last_exc = exc
+            if exc.code in (403, 418) and attempt + 1 < attempts:
+                continue
             if 400 <= exc.code < 500 and exc.code != 429:
                 break
         except Exception as exc:
             last_exc = exc
         if attempt + 1 < attempts:
-            time.sleep(0.4 * (attempt + 1))
+            time.sleep(0.35 * (attempt + 1))
     raise ProxySourceError(str(last_exc or "Download failed")) from last_exc
 
 
-async def download_proxy_source(url: str, timeout: int = 20) -> str:
-    return await asyncio.to_thread(_download_text_sync, url, timeout)
+async def download_proxy_source(url: str, timeout: int = 20, retries: int = 2) -> str:
+    return await asyncio.to_thread(_download_text_sync, url, timeout, retries)
 
 
 # Retain backward compatibility

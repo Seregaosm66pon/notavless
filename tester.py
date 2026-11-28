@@ -41,6 +41,7 @@ from checker import (
     build_health_report,
     build_tls_client_hello,
     check_node_advanced,
+    compute_node_grade,
     detect_country_info,
     enrich_results_geoip,
     find_sing_box_executable,
@@ -51,6 +52,7 @@ from checker import (
     probe_nodes_http_batch,
     probe_proxy_exit_ip,
     probe_proxy_http,
+    run_hardcore_stress_batch,
 )
 from config import (
     HYSTERIA2_SUBSCRIPTION_OUTPUT,
@@ -64,7 +66,12 @@ from config import (
     VPN_SUBSCRIPTION_OUTPUT_LTE,
     VPN_SUBSCRIPTION_OUTPUT_WIFI,
 )
-from protocols import ParsedConfig, parse_any_proxy_url
+from protocols import (
+    ParsedConfig,
+    decrypt_or_extract_target,
+    is_encrypted_sub_or_wrapper,
+    parse_any_proxy_url,
+)
 from refresh_vless_repo import normalize_urls, write_base64_file, write_output_file
 
 console = Console()
@@ -461,40 +468,44 @@ def display_results_dashboard(rep: dict, results: list[NodeCheckResult], source_
         border_style="bright_blue",
         padding=(0, 1),
     )
-    top_table.add_column("№", justify="center", width=5)
-    top_table.add_column("Страна", width=16)
-    top_table.add_column("Протокол", width=8)
-    top_table.add_column("Защита & Транспорт", width=23)
-    top_table.add_column("Сервер (Host:Port)", width=23)
-    top_table.add_column("TCP RTT", justify="right", width=10)
-    top_table.add_column("Джиттер", justify="right", width=9)
-    top_table.add_column("График", justify="center", width=8)
-    top_table.add_column("Туннель & Скорость", justify="center", width=22)
-    top_table.add_column("Качество", justify="center", width=11)
+    top_table.add_column("№", justify="center", width=5, min_width=4, no_wrap=True)
+    top_table.add_column("Страна & Провайдер", min_width=15, ratio=2)
+    top_table.add_column("Протокол & Защита", min_width=15, ratio=2)
+    top_table.add_column("Сервер (Host:Port)", min_width=17, ratio=2)
+    top_table.add_column("RTT / Джиттер", justify="right", min_width=9, no_wrap=True)
+    top_table.add_column("Тренд", justify="center", width=6, min_width=5, no_wrap=True)
+    top_table.add_column("Туннель & Скорость", justify="center", min_width=16, ratio=2)
+    top_table.add_column("Ранг", justify="center", width=7, min_width=6, no_wrap=True)
 
-    medals = ["🥇 #1", "🥈 #2", "🥉 #3"]
+    medals = ["🥇#1", "🥈#2", "🥉#3"]
     for idx, node in enumerate(rep["fastest_nodes"][:15], 1):
         rank_str = medals[idx - 1] if idx <= 3 else f"{idx:02d}"
-        flag_country = f"{node['flag']} {node['country_name']}"
+        wl_badge = " [bold bright_green][WL][/]" if node.get("wl_asn") else ""
+        isp_short = f"\n[dim]{node['isp'][:18]}[/]" if node.get("isp") else ""
+        flag_country = f"{node['flag']} {node['country_name']}{wl_badge}{isp_short}"
 
-        proto_str = f"[bold cyan]{node['protocol']}[/]"
-        sec_str = f"[bright_cyan]{node['security']}[/]"
-
+        sec_str = f"[bold cyan]{node['protocol']}[/] [bright_cyan]{node['security']}[/]"
         host_str = f"{node['host']}:{node['port']}"
+        if len(host_str) > 22:
+            host_str = f"{node['host'][:15]}..:{node['port']}"
+        if node.get("exit_ip") and node.get("exit_ip") != node["host"]:
+            host_str += f"\n[dim]↳ {node['exit_ip']}[/]"
+
         ping_val = node["latency_ms"]
         ping_color = "bright_green" if ping_val < 60 else "green" if ping_val < 100 else "yellow" if ping_val < 200 else "red"
-        ping_str = f"[bold {ping_color}]{ping_val:.1f}ms[/]"
-
-        jit_str = f"[dim]±{node['jitter_ms']:.1f}ms[/]"
+        ping_jit_str = f"[bold {ping_color}]{ping_val:.1f}ms[/]\n[dim]±{node['jitter_ms']:.1f}ms[/]"
         spark_str = f"[{ping_color}]{node['sparkline']}[/]"
-        tier_str = f"[bold {ping_color}]{node['tier']}[/]"
+        tier_str = node.get("grade") or f"[bold {ping_color}]{node['tier']}[/]"
 
         spd = node.get("speed_mbps", 0.0)
         if node.get("http_ok"):
-            spd_part = f" [bold cyan]⚡{spd:.1f}Mbps[/]" if spd > 0 else ""
-            http_disp = f"[bold bright_green]✔ {node.get('http_delay_ms', 0):.0f}ms[/]{spd_part}"
+            spd_part = f"\n[bold cyan]⚡ {spd:.1f} Mbps[/]" if spd > 0 else ""
+            if node.get("multi_total", 0) > 0:
+                http_disp = f"[bold bright_green]✔ {node['multi_ok']}/{node['multi_total']} ({node.get('http_delay_ms', 0):.0f}ms)[/]{spd_part}"
+            else:
+                http_disp = f"[bold bright_green]✔ {node.get('http_delay_ms', 0):.0f}ms[/]{spd_part}"
         elif node.get("http_probe_msg"):
-            http_disp = f"[dim red]✗ {node.get('http_probe_msg')[:16]}[/]"
+            http_disp = f"[dim red]✗ {node.get('http_probe_msg')[:18]}[/]"
         elif node.get("tls_ok"):
             http_disp = f"[bright_cyan]⚡ {node.get('tls_detail') or 'TLS Pass'}[/]"
         else:
@@ -503,11 +514,9 @@ def display_results_dashboard(rep: dict, results: list[NodeCheckResult], source_
         top_table.add_row(
             rank_str,
             flag_country,
-            proto_str,
             sec_str,
             host_str,
-            ping_str,
-            jit_str,
+            ping_jit_str,
             spark_str,
             http_disp,
             tier_str,
@@ -817,6 +826,135 @@ async def _run_top_exit_ip(results: list[NodeCheckResult], count: int = 3) -> No
             console.print(f"  [{idx}] {r.config.host}:{r.config.port} -> [dim red]{exit_isp}[/]")
 
 
+async def _run_hardcore_with_progress(
+    results: list[NodeCheckResult],
+    top_n: int = 15,
+) -> list[NodeCheckResult]:
+    alive_candidates = [r for r in results if r.alive and not (r.http_probe_msg and not r.http_ok)][:top_n]
+    if not alive_candidates:
+        alive_candidates = [r for r in results if r.alive][:top_n]
+    if not alive_candidates:
+        return results
+
+    total = len(alive_candidates)
+    progress = Progress(
+        SpinnerColumn(style="bold red"),
+        TextColumn("[bold red]🔥 ЖЁСТКИЙ СТРЕСС-ТЕСТ (3x HTTP/HTTPS Burst + Mbps + Exit IP + WL-ASN)[/]"),
+        BarColumn(bar_width=24, complete_style="red", finished_style="bright_green"),
+        TextColumn("[bold white]{task.completed}/{task.total}[/]"),
+        console=console,
+    )
+    task_id = progress.add_task("hardcore", total=total)
+
+    def on_done(done: int, tot: int, r: NodeCheckResult) -> None:
+        progress.update(
+            task_id,
+            completed=done,
+            description=(
+                f"[bold red]🔥[/] {r.country_flag} [cyan]{r.config.host}:{r.config.port}[/] "
+                f"-> {r.grade or compute_node_grade(r)} "
+                f"([green]{r.multi_ok}/{r.multi_total}[/] • [yellow]{r.speed_mbps:.1f}M[/])"
+            ),
+        )
+
+    with progress:
+        return await run_hardcore_stress_batch(results, top_n=top_n, concurrency=5, progress_cb=on_done)
+
+
+async def execute_encrypted_sub_test(
+    target: str,
+    hardcore: bool = True,
+    deep_http: bool = True,
+    limit: int = 120,
+    interactive: bool = True,
+    deep_limit: int = 20,
+) -> list[NodeCheckResult]:
+    """Decrypt happ://crypt*, incy://crypt*, v2raytun://import*, Base64/YAML/URL and benchmark extracted nodes."""
+    console.print(f"\n[bold magenta]🔓 Запускаю Sub-Decrypter для:[/] [cyan]{target[:96]}{'...' if len(target) > 96 else ''}[/]")
+    urls, resolved_source, err = await asyncio.to_thread(decrypt_or_extract_target, target, 10)
+    if err or not urls:
+        console.print(f"[bold red][-] Не удалось расшифровать или извлечь конфиги: {err}[/]")
+        return []
+
+    if resolved_source and resolved_source != target:
+        console.print(f"[green][+][/] Источник развернут: [cyan]{resolved_source[:90]}[/]")
+    console.print(f"[bold green][+][/] Извлечено сырых ссылок: [bold white]{len(urls)}[/]")
+
+    configs: list[ParsedConfig] = []
+    seen: set[str] = set()
+    for raw_u in urls:
+        p = parse_any_proxy_url(raw_u)
+        if p and p.raw_url not in seen:
+            seen.add(p.raw_url)
+            configs.append(p)
+
+    if not configs:
+        console.print("[bold red][-] Поддерживаемых узлов (vless/trojan/hy2) внутри подписки не найдено.[/]")
+        return []
+
+    if limit and limit > 0:
+        configs = configs[:limit]
+
+    label = f"Decrypted Sub ({len(configs)})"
+    session = BenchmarkSessionUI(configs, concurrency=48, label=label)
+    last_render = 0.0
+    with Live(session.make_live_renderable(), console=console, refresh_per_second=8) as live:
+        def on_done(done: int, total: int, res: NodeCheckResult) -> None:
+            nonlocal last_render
+            session.on_node_done(done, total, res)
+            now = time.monotonic()
+            if done == total or (now - last_render) >= 0.12:
+                last_render = now
+                live.update(session.make_live_renderable())
+
+        results = await benchmark_nodes(configs, concurrency=48, progress_callback=on_done)
+
+    await asyncio.to_thread(enrich_results_geoip, results, 2.0)
+
+    if hardcore and any(r.alive for r in results):
+        results = await _run_hardcore_with_progress(results, top_n=min(deep_limit, 15))
+    elif deep_http and any(r.alive for r in results):
+        results = await _run_batch_http_with_progress(results, top_n=deep_limit)
+
+    for r in results:
+        if not r.grade:
+            r.grade = compute_node_grade(r)
+
+    rep = build_health_report(results)
+    display_results_dashboard(rep, results, source_label=label)
+
+    if interactive and sys.stdin.isatty():
+        while True:
+            alive_nodes = [r for r in results if r.alive]
+            console.print("\n[bold cyan]⚡ ДЕЙСТВИЯ ПОСЛЕ ВЗЛОМА ПОДПИСКИ:[/]")
+            console.print(" [1] 📋 Скопировать [bold gold1]#1 самый мощный узел[/] в буфер обмена")
+            console.print(" [2] 📦 Скопировать [bold cyan]ТОП-5 лучших узлов[/] одним списком")
+            console.print(" [3] 🔥 Повторно прогнать [bold red]ЖЁСТКИЙ СТРЕСС-ТЕСТ[/] по Топ-15")
+            console.print(" [4] 💾 Сохранить расшифрованные конфиги в decrypted_sub.txt")
+            console.print(" [0] 🚪 Назад")
+            try:
+                ch = console.input("[bold yellow]Выберите пункт [0-4]: [/]").strip()
+            except (KeyboardInterrupt, EOFError):
+                break
+            if ch == "1" and alive_nodes:
+                if copy_to_clipboard(alive_nodes[0].config.raw_url):
+                    console.print("[bold green]✔ #1 узел скопирован![/]")
+            elif ch == "2" and alive_nodes:
+                if copy_to_clipboard("\n".join(r.config.raw_url for r in alive_nodes[:5])):
+                    console.print("[bold green]✔ ТОП-5 скопированы![/]")
+            elif ch == "3" and alive_nodes:
+                results = await _run_hardcore_with_progress(results, top_n=15)
+                rep = build_health_report(results)
+                display_results_dashboard(rep, results, source_label=label)
+            elif ch == "4" and configs:
+                out_p = REPO_ROOT / "decrypted_sub.txt"
+                out_p.write_text("\n".join(c.raw_url for c in configs) + "\n", encoding="utf-8")
+                console.print(f"[bold green]✔ Сохранено {len(configs)} конфигов в {out_p.name}![/]")
+            elif ch in ("0", "q", "exit"):
+                break
+    return results
+
+
 async def execute_benchmark_interactive(
     limit: int = 100,
     deep_http: bool = False,
@@ -826,6 +964,7 @@ async def execute_benchmark_interactive(
     proto: str = "",
     deep_limit: int = 50,
     speedtest: bool = False,
+    hardcore: bool = False,
 ) -> list[NodeCheckResult]:
     """Run full benchmark session with throttled Rich Live UI, GeoIP, Dual-Core HTTP Probe, and Speedtest."""
     sub_file = _resolve_source_file(source)
@@ -866,16 +1005,25 @@ async def execute_benchmark_interactive(
             progress_callback=on_done,
         )
 
-    # Enrich unknown country flags via fast batch GeoIP
+    # Enrich unknown country flags & RKP WL-ASN via fast batch GeoIP
     await asyncio.to_thread(enrich_results_geoip, results, 2.0)
 
-    # Optional Dual-Core Deep HTTP Proxy Probe
-    if deep_http and any(r.alive for r in results):
-        results = await _run_batch_http_with_progress(results, top_n=deep_limit)
+    if hardcore and any(r.alive for r in results):
+        if deep_http:
+            results = await _run_batch_http_with_progress(results, top_n=deep_limit)
+        results = await _run_hardcore_with_progress(results, top_n=min(15, max(5, deep_limit)))
+    else:
+        # Optional Dual-Core Deep HTTP Proxy Probe
+        if deep_http and any(r.alive for r in results):
+            results = await _run_batch_http_with_progress(results, top_n=deep_limit)
 
-    # Optional Speedtest on top nodes
-    if speedtest and any(r.alive for r in results):
-        await _run_top_speedtest(results, count=3)
+        # Optional Speedtest on top nodes
+        if speedtest and any(r.alive for r in results):
+            await _run_top_speedtest(results, count=3)
+
+    for r in results:
+        if not r.grade:
+            r.grade = compute_node_grade(r)
 
     rep = build_health_report(results)
     display_results_dashboard(rep, results, source_label=sub_file.name)
@@ -896,10 +1044,11 @@ async def execute_benchmark_interactive(
         console.print(" [7] 📄 Сохранить подробный JSON отчет (audit_report.json)")
         console.print(" [8] 📋 Скопировать ссылку на универсальную подписку")
         console.print(" [9] 🌐 Проверить реальный Exit IP и провайдера на ТОП-3 узлах")
+        console.print(" [10] 🔥 [bold red]ЗАПУСТИТЬ ЖЁСТКИЙ СТРЕСС-ТЕСТ[/] (Burst 3x + Mbps + Exit IP + S+ Grade)")
         console.print(" [0] 🚪 Вернуться / Выход")
 
         try:
-            choice = console.input("[bold yellow]Выберите пункт [0-9]: [/]").strip()
+            choice = console.input("[bold yellow]Выберите пункт [0-10]: [/]").strip()
         except (KeyboardInterrupt, EOFError):
             break
 
@@ -976,9 +1125,16 @@ async def execute_benchmark_interactive(
                         "country": r.country_name,
                         "flag": r.country_flag,
                         "tier": r.quality_tier,
+                        "grade": r.grade or compute_node_grade(r),
                         "http_ok": r.http_ok,
                         "http_delay_ms": r.http_delay_ms,
+                        "multi_ok": r.multi_ok,
+                        "multi_total": r.multi_total,
                         "speed_mbps": r.speed_mbps,
+                        "exit_ip": r.exit_ip,
+                        "exit_country": r.exit_country,
+                        "isp": r.isp,
+                        "wl_asn": r.wl_asn,
                         "raw_url": r.config.raw_url,
                     }
                     for r in results
@@ -996,6 +1152,14 @@ async def execute_benchmark_interactive(
                 await _run_top_exit_ip(results, count=3)
             else:
                 console.print("[bold red]Нет живых узлов для проверки.[/]")
+        elif choice == "10":
+            if alive_nodes:
+                results = await _run_hardcore_with_progress(results, top_n=15)
+                rep = build_health_report(results)
+                display_results_dashboard(rep, results, source_label=sub_file.name)
+                console.print("[bold bright_green]✔ ЖЁСТКИЙ СТРЕСС-ТЕСТ завершен! Лидерборд пересчитан по рейтингу S+![/]")
+            else:
+                console.print("[bold red]Нет живых узлов для стресс-теста.[/]")
         elif choice in ("0", "q", "exit"):
             break
 
@@ -1012,10 +1176,12 @@ def main_interactive_menu() -> None:
             """ [bold cyan][1][/] ⚡ [bold white]Экспресс-аудит[/] [dim](Топ-30 серверов из mega_sub — 2-3 сек)[/]
  [bold green][2][/] 🚀 [bold white]Стандартный бенчмарк[/] [dim](Топ-100 серверов из mega_sub)[/]
  [bold magenta][3][/] 🌌 [bold white]Глубокий аудит всей базы[/] [dim](Все серверы из mega_sub.txt)[/]
- [bold bright_green][4][/] 🎯 [bold white]Умный Deep HTTP Audit[/] [dim](Dual-Core sing-box + Xray реальный HTTP 204 до 50 узлов!)[/]
- [bold yellow][5][/] 🔬 [bold white]DPI + Speedtest + Exit IP одного узла[/] [dim](vless/trojan/hy2 или host:port)[/]
- [bold blue][6][/] 📱 [bold white]Тест LTE / Whitelist подписок + HTTP Probe[/] [dim](vless_lte.txt для мобильной связи)[/]
- [bold white][7][/] 🌍 [bold white]Фильтр по файлу / стране / протоколу[/] [dim](de/nl/fi/ru, reality/trojan/hy2/xhttp)[/]
+ [bold red][4][/] 🔥 [bold bright_red]ЖЁСТКИЙ СТРЕСС-ТЕСТ[/] [dim](3x Burst + Speedtest Mbps + Exit IP + S+ Grade + RKP WL)[/]
+ [bold bright_green][5][/] 🎯 [bold white]Умный Deep HTTP Audit[/] [dim](Dual-Core sing-box + Xray реальный HTTP 204 до 50 узлов!)[/]
+ [bold yellow][6][/] 🔬 [bold white]DPI + Speedtest + Exit IP одного узла[/] [dim](vless/trojan/hy2 или host:port)[/]
+ [bold blue][7][/] 📱 [bold white]Тест LTE / Whitelist подписок + Жёсткий тест[/] [dim](vless_lte.txt для мобильной связи)[/]
+ [bold white][8][/] 🌍 [bold white]Фильтр по файлу / стране / протоколу[/] [dim](de/nl/fi/ru, reality/trojan/hy2/xhttp)[/]
+ [bold bright_magenta][9][/] 🔓 [bold white]Взломать сабку (Sub-Decrypter)[/] [dim](happ://crypt*, incy://crypt*, v2raytun://, URL -> тест)[/]
  [bold red][0][/] 🚪 [bold white]Выход[/]""",
             title="[bold bright_white]ГЛАВНОЕ МЕНЮ ТЕСТЕРА[/]",
             border_style="bright_cyan",
@@ -1025,7 +1191,7 @@ def main_interactive_menu() -> None:
         console.print(menu_panel)
 
         try:
-            choice = console.input("[bold yellow]Выберите режим [0-7]: [/]").strip()
+            choice = console.input("[bold yellow]Выберите режим [0-9]: [/]").strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\nВыход.")
             break
@@ -1040,36 +1206,51 @@ def main_interactive_menu() -> None:
             asyncio.run(execute_benchmark_interactive(limit=0, deep_http=False))
             console.input("\n[dim]Нажмите Enter для продолжения...[/]")
         elif choice == "4":
-            asyncio.run(execute_benchmark_interactive(limit=0, deep_http=True, deep_limit=50))
+            asyncio.run(execute_benchmark_interactive(limit=80, deep_http=True, deep_limit=25, hardcore=True))
             console.input("\n[dim]Нажмите Enter для продолжения...[/]")
         elif choice == "5":
+            asyncio.run(execute_benchmark_interactive(limit=0, deep_http=True, deep_limit=50))
+            console.input("\n[dim]Нажмите Enter для продолжения...[/]")
+        elif choice == "6":
             try:
                 target = console.input("[bold cyan]Введите ссылку vless/trojan/hy2 или host:port: [/]").strip()
                 if target:
-                    asyncio.run(run_single_node_diagnostic(target))
+                    if is_encrypted_sub_or_wrapper(target):
+                        asyncio.run(execute_encrypted_sub_test(target, hardcore=True))
+                    else:
+                        asyncio.run(run_single_node_diagnostic(target))
             except (KeyboardInterrupt, EOFError):
                 pass
             console.input("\n[dim]Нажмите Enter для продолжения...[/]")
-        elif choice == "6":
-            asyncio.run(execute_benchmark_interactive(limit=0, deep_http=True, deep_limit=40, source="lte"))
-            console.input("\n[dim]Нажмите Enter для продолжения...[/]")
         elif choice == "7":
+            asyncio.run(execute_benchmark_interactive(limit=0, deep_http=True, deep_limit=25, source="lte", hardcore=True))
+            console.input("\n[dim]Нажмите Enter для продолжения...[/]")
+        elif choice == "8":
             try:
                 src = console.input("[bold cyan]Источник (mega/fastest/lte/wifi/trojan/hy2) [mega]: [/]").strip() or "mega"
                 cntry = console.input("[bold cyan]Фильтр страны (например de, nl, fi, ru, пусто=все): [/]").strip()
                 pr = console.input("[bold cyan]Фильтр протокола (reality/vless/trojan/hy2/ws/xhttp, пусто=все): [/]").strip()
-                deep_ans = console.input("[bold cyan]Запустить Deep HTTP Probe? [Y/n]: [/]").strip().lower()
-                use_deep = deep_ans not in ("n", "no", "н", "нет")
+                hc_ans = console.input("[bold cyan]Запустить Жёсткий Стресс-Тест (S+ Grade + Speed)? [Y/n]: [/]").strip().lower()
+                use_hc = hc_ans not in ("n", "no", "н", "нет")
                 asyncio.run(
                     execute_benchmark_interactive(
                         limit=0,
-                        deep_http=use_deep,
-                        deep_limit=40,
+                        deep_http=use_hc,
+                        deep_limit=30,
                         source=src,
                         country=cntry,
                         proto=pr,
+                        hardcore=use_hc,
                     )
                 )
+            except (KeyboardInterrupt, EOFError):
+                pass
+            console.input("\n[dim]Нажмите Enter для продолжения...[/]")
+        elif choice == "9":
+            try:
+                sub_target = console.input("[bold magenta]Вставьте happ://crypt*, incy://, v2raytun:// или https:// URL: [/]").strip()
+                if sub_target:
+                    asyncio.run(execute_encrypted_sub_test(sub_target, hardcore=True))
             except (KeyboardInterrupt, EOFError):
                 pass
             console.input("\n[dim]Нажмите Enter для продолжения...[/]")
@@ -1080,33 +1261,47 @@ def main_interactive_menu() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Nota Vless Ultimate Speed Tester")
-    parser.add_argument("target", nargs="?", default="", help="Single node URL or host:port to test")
+    parser.add_argument("target", nargs="?", default="", help="Single node URL, host:port, or encrypted sub (happ://crypt*, https://...)")
     parser.add_argument("--limit", type=int, default=0, help="Max nodes to test in benchmark")
     parser.add_argument("--all", action="store_true", help="Test all nodes from selected subscription")
     parser.add_argument("--deep", "--http-probe", action="store_true", help="Run Deep HTTP delay probe on top nodes")
     parser.add_argument("--deep-limit", type=int, default=50, help="Max nodes to verify in Deep HTTP Probe")
     parser.add_argument("--speedtest", action="store_true", help="Also run Mbps speedtest on top verified nodes")
+    parser.add_argument("--hardcore", "--stress", action="store_true", help="Run hardcore torture test (3x Burst + Mbps + Exit IP + WL-ASN + S+ Grade)")
     parser.add_argument("--source", default="mega", help="Subscription source (mega/fastest/lte/wifi/trojan/hy2/local or file path)")
     parser.add_argument("--country", default="", help="Filter nodes by country code or name (e.g. de, nl, fi, ru)")
     parser.add_argument("--proto", default="", help="Filter nodes by protocol/transport (e.g. reality, vless, trojan, hy2, ws, xhttp)")
     parser.add_argument("--non-interactive", "-y", action="store_true", help="Run in non-interactive batch mode (no prompts)")
     args = parser.parse_args()
 
+    is_inter = not args.non_interactive and sys.stdin.isatty()
     if args.target:
-        asyncio.run(run_single_node_diagnostic(args.target))
-    elif args.all or args.limit or args.deep or args.country or args.proto or args.source != "mega":
+        if is_encrypted_sub_or_wrapper(args.target):
+            asyncio.run(
+                execute_encrypted_sub_test(
+                    args.target,
+                    hardcore=args.hardcore or True,
+                    deep_http=True,
+                    limit=args.limit or 120,
+                    interactive=is_inter,
+                    deep_limit=args.deep_limit,
+                )
+            )
+        else:
+            asyncio.run(run_single_node_diagnostic(args.target))
+    elif args.all or args.limit or args.deep or args.hardcore or args.speedtest or args.country or args.proto or args.source != "mega":
         lim = 0 if args.all else args.limit
-        is_inter = not args.non_interactive and sys.stdin.isatty()
         asyncio.run(
             execute_benchmark_interactive(
                 limit=lim,
-                deep_http=args.deep,
+                deep_http=args.deep or args.hardcore,
                 interactive=is_inter,
                 source=args.source,
                 country=args.country,
                 proto=args.proto,
                 deep_limit=args.deep_limit,
                 speedtest=args.speedtest,
+                hardcore=args.hardcore,
             )
         )
     else:

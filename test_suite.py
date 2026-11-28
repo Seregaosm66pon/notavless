@@ -538,5 +538,81 @@ class TestGitPublicationLogic(unittest.TestCase):
         self.assertEqual(status, "skip: no changed files")
 
 
+class TestRKPAndHardcoreIntegration(unittest.TestCase):
+    def test_extract_yaml_and_nested_base64_preserves_remarks(self):
+        import base64
+        from protocols import extract_all_proxy_urls
+
+        raw_vless = "vless://11111111-1111-1111-1111-111111111111@198.51.100.7:443?security=reality&sni=google.com&pbk=abc&type=tcp#Super%20RU%20Node"
+        b64_payload = base64.b64encode(raw_vless.encode("utf-8")).decode("ascii")
+        urls = extract_all_proxy_urls(b64_payload)
+        self.assertTrue(any("#Super%20RU%20Node" in u for u in urls), urls)
+
+        clash_yaml = (
+            "proxies:\n"
+            "  - name: Berlin Reality\n"
+            "    type: vless\n"
+            "    server: 203.0.113.55\n"
+            "    port: 443\n"
+            "    uuid: 22222222-2222-2222-2222-222222222222\n"
+            "    tls: true\n"
+            "    servername: ya.ru\n"
+            "    reality-opts:\n"
+            "      public-key: pub123\n"
+            "      short-id: ab12\n"
+        )
+        yaml_urls = extract_all_proxy_urls(clash_yaml)
+        self.assertTrue(any("203.0.113.55:443" in u and "Berlin" in u for u in yaml_urls), yaml_urls)
+
+    def test_whitelist_asn_detection(self):
+        from checker import is_whitelist_asn, load_whitelist_asns
+
+        asns = load_whitelist_asns()
+        self.assertGreater(len(asns), 100)
+        hit, org = is_whitelist_asn("AS9123 Timeweb Ltd.")
+        self.assertTrue(hit)
+        self.assertIn("Timeweb", org)
+        miss, _ = is_whitelist_asn("AS15169 Google LLC")
+        self.assertFalse(miss)
+
+    def test_compute_node_grade(self):
+        from checker import NodeCheckResult, compute_node_grade
+        from protocols import ParsedConfig
+
+        cfg = ParsedConfig(
+            protocol="vless", uuid="u1", host="198.51.100.1", port=443,
+            remark="DE", security="reality", network_type="tcp",
+            path="", host_header="", sni="google.com", alpn="", fingerprint="chrome",
+            public_key="abc", short_id="", raw_url="vless://...",
+        )
+        s_plus = NodeCheckResult(
+            config=cfg, alive=True, latency_ms=45.0, tls_ok=True,
+            country_code="de", country_flag="🇩🇪", country_name="Германия",
+            quality_tier="⚡ ULTRA", http_ok=True, http_delay_ms=110.0,
+            speed_mbps=42.0, multi_ok=3, multi_total=3, wl_asn=True,
+        )
+        self.assertEqual(compute_node_grade(s_plus), "🏆 S+")
+
+        dead = NodeCheckResult(
+            config=cfg, alive=False, latency_ms=9999.0, tls_ok=False,
+            country_code="xx", country_flag="🌐", country_name="Неизвестно",
+            quality_tier="💀 DEAD",
+        )
+        self.assertEqual(compute_node_grade(dead), "💀 D")
+
+    def test_select_sources_for_run_rotation(self):
+        from refresh_vless_repo import _select_sources_for_run
+
+        items = [("https://priority.example/1.txt", "@serega")] + [
+            (f"https://rkp.example/{i}.txt", "@RKP_channel") for i in range(500)
+        ]
+        priority, bulk = _select_sources_for_run(items, max_bulk_per_run=50)
+        self.assertEqual(priority, [("https://priority.example/1.txt", "@serega")])
+        self.assertEqual(len(bulk), 50)
+        all_priority, all_bulk = _select_sources_for_run(items, max_bulk_per_run=0)
+        self.assertEqual(len(all_priority), 1)
+        self.assertEqual(len(all_bulk), 500)
+
+
 if __name__ == "__main__":
     unittest.main()

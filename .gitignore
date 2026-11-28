@@ -218,3 +218,7 @@ audit_report.json
 local_fastest.txt
 local_fastest_base64.txt
 .geoip_cache.json
+.source_health.json
+device.json
+settings.json
+rkp_sources_raw.txt

@@ -249,14 +249,59 @@ class NodeCheckResult:
     exit_country: str = ""
     tls_detail: str = ""
     sni_ok: bool = False
+    asn: str = ""
+    isp: str = ""
+    wl_asn: bool = False
+    grade: str = ""
+    multi_ok: int = 0
+    multi_total: int = 0
 
     @property
     def display_tag(self) -> str:
         flag = self.country_flag or "🌐"
         if self.alive:
             http_tag = " [HTTP ✔]" if self.http_ok else ""
-            return f"{flag} {self.latency_ms:.0f}ms [{self.quality_tier}]{http_tag}"
+            grade_tag = f" [{self.grade}]" if self.grade else ""
+            return f"{flag} {self.latency_ms:.0f}ms [{self.quality_tier}]{http_tag}{grade_tag}"
         return f"{flag} DEAD ({self.error_msg or 'timeout'})"
+
+
+_WL_ASNS_CACHE: dict[str, str] | None = None
+
+
+def load_whitelist_asns(file_path: Path | None = None) -> dict[str, str]:
+    """Load RKP Russian Whitelist ASNs from wl_hostings.txt -> {asn_num: org_name}."""
+    global _WL_ASNS_CACHE
+    if file_path is None and _WL_ASNS_CACHE is not None:
+        return _WL_ASNS_CACHE
+    target = file_path or (REPO_ROOT / "wl_hostings.txt")
+    mapping: dict[str, str] = {}
+    try:
+        if target.exists():
+            for line in target.read_text(encoding="utf-8", errors="ignore").splitlines():
+                cleaned = line.strip()
+                if not cleaned or cleaned.startswith("#"):
+                    continue
+                parts = cleaned.split(None, 1)
+                asn_num = re.sub(r"[^0-9]", "", parts[0])
+                if asn_num:
+                    mapping[asn_num] = parts[1].strip() if len(parts) > 1 else ""
+    except Exception:
+        pass
+    if file_path is None:
+        _WL_ASNS_CACHE = mapping
+    return mapping
+
+
+def is_whitelist_asn(asn_or_text: str) -> tuple[bool, str]:
+    """Check if ASN string (e.g. 'AS9123 Timeweb') belongs to RKP Russian whitelist ASNs."""
+    asns = load_whitelist_asns()
+    if not asn_or_text or not asns:
+        return False, ""
+    m = re.search(r"\b(?:AS)?(\d{2,7})\b", asn_or_text, re.IGNORECASE)
+    if m and m.group(1) in asns:
+        return True, asns[m.group(1)]
+    return False, ""
 
 
 def detect_country_info(remark: str, host: str = "", sni: str = "") -> tuple[str, str, str]:
@@ -421,20 +466,61 @@ def enrich_country_geoip_batch(ips: Sequence[str], timeout: float = 2.0) -> dict
 
 
 def enrich_results_geoip(results: Sequence[NodeCheckResult], timeout: float = 2.0) -> int:
-    """Enrich alive NodeCheckResult entries that fell back to generic 'Сервер' via batch GeoIP."""
+    """Enrich alive NodeCheckResult entries with country flags + RKP WL-ASN tags via batch GeoIP."""
     targets = [
         r for r in results
-        if r.alive and r.country_code == "xx" and _is_ipv4_or_ipv6(r.config.host)
+        if r.alive and _is_ipv4_or_ipv6(r.config.host) and (r.country_code == "xx" or not r.asn)
     ]
     if not targets:
         return 0
-    mapping = enrich_country_geoip_batch([r.config.host for r in targets], timeout=timeout)
+    _load_geoip_cache()
+    ips_missing_cc = [r.config.host for r in targets if r.country_code == "xx"]
+    mapping = enrich_country_geoip_batch([r.config.host for r in targets], timeout=timeout) if ips_missing_cc or not _GEOIP_MEM_CACHE else {}
+    # Also fetch AS/ISP cleanly in single batch for top 100 alive nodes
+    meta_map: dict[str, tuple[str, str, bool]] = {}
+    top_ips = []
+    for r in targets[:100]:
+        cip = r.config.host.strip("[]")
+        if cip not in top_ips:
+            top_ips.append(cip)
+    if top_ips:
+        try:
+            body = json.dumps([{"query": q} for q in top_ips]).encode("utf-8")
+            req = urllib.request.Request(
+                "http://ip-api.com/batch?fields=status,query,countryCode,isp,as",
+                data=body,
+                headers={"Content-Type": "application/json", "User-Agent": "NotaVless/3.0"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                items = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            if isinstance(items, list):
+                for item in items:
+                    if item.get("status") == "success":
+                        q = item.get("query", "")
+                        as_str = str(item.get("as", ""))
+                        isp_str = str(item.get("isp", ""))
+                        wl_hit, _ = is_whitelist_asn(as_str)
+                        meta_map[q] = (as_str, isp_str, wl_hit)
+                        cc = (item.get("countryCode") or "").lower()
+                        if q and cc:
+                            _GEOIP_MEM_CACHE[q] = cc
+                            mapping[q] = (cc, _code_to_flag(cc), COUNTRY_RU_NAMES.get(cc, cc.upper()))
+                _save_geoip_cache()
+        except Exception:
+            pass
+
     updated = 0
     for r in targets:
-        info = mapping.get(r.config.host.strip("[]")) or mapping.get(r.config.host)
-        if info:
+        cip = r.config.host.strip("[]")
+        info = mapping.get(cip) or mapping.get(r.config.host)
+        if info and r.country_code == "xx":
             r.country_code, r.country_flag, r.country_name = info
             updated += 1
+        meta = meta_map.get(cip)
+        if meta:
+            r.asn, r.isp, r.wl_asn = meta
+            if not r.wl_asn and r.isp:
+                r.wl_asn, _ = is_whitelist_asn(r.isp)
     return updated
 
 
@@ -1849,7 +1935,232 @@ def build_health_report(results: list[NodeCheckResult]) -> dict:
                 "http_delay_ms": r.http_delay_ms,
                 "http_probe_msg": r.http_probe_msg,
                 "speed_mbps": r.speed_mbps,
+                "grade": r.grade,
+                "multi_ok": r.multi_ok,
+                "multi_total": r.multi_total,
+                "exit_ip": r.exit_ip,
+                "exit_country": r.exit_country,
+                "isp": r.isp,
+                "wl_asn": r.wl_asn,
             }
-            for r in alive[:15]
+            for r in alive[:20]
         ],
     }
+
+
+def compute_node_grade(res: NodeCheckResult) -> str:
+    """Compute composite server grade (S+ .. D) from real HTTP transit, concurrency, speed, jitter, and security."""
+    if not res.alive:
+        return "💀 D"
+    if res.http_probe_msg and not res.http_ok:
+        return "🔴 D"
+
+    score = 0.0
+    eff_ms = res.http_delay_ms if res.http_ok else (res.latency_ms * 1.4)
+    if eff_ms < 120:
+        score += 40
+    elif eff_ms < 250:
+        score += 32
+    elif eff_ms < 450:
+        score += 22
+    elif eff_ms < 750:
+        score += 12
+    else:
+        score += 4
+
+    if res.http_ok:
+        score += 20
+
+    if res.multi_total > 0:
+        score += 20.0 * (res.multi_ok / res.multi_total)
+    elif res.http_ok:
+        score += 10.0
+
+    if res.speed_mbps >= 15.0:
+        score += 15
+    elif res.speed_mbps >= 5.0:
+        score += 11
+    elif res.speed_mbps >= 1.5:
+        score += 6
+    elif res.speed_mbps > 0:
+        score += 3
+
+    sec_l = (res.config.security or "").lower()
+    if sec_l == "reality":
+        score += 6
+    if res.jitter_ms <= 8.0:
+        score += 4
+    elif res.jitter_ms <= 25.0:
+        score += 2
+
+    if score >= 88:
+        return "🏆 S+"
+    if score >= 75:
+        return "🔥 S"
+    if score >= 60:
+        return "⚡ A"
+    if score >= 42:
+        return "🟢 B"
+    if score >= 25:
+        return "🟡 C"
+    return "🔴 D"
+
+
+def _hardcore_stress_one_sync(res: NodeCheckResult, timeout: float = 5.0) -> NodeCheckResult:
+    """
+    Execute hardcore multi-target + parallel burst stress + bandwidth speed + exit IP audit
+    against a single node via its local HTTP proxy core.
+    """
+    proc, port, cfg_path = _run_temp_http_proxy(res.config)
+    try:
+        if not proc or not port:
+            res.http_ok = False
+            res.http_probe_msg = "No core"
+            res.grade = compute_node_grade(res)
+            return res
+
+        proxy_url = f"http://127.0.0.1:{port}"
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+
+        # 1. Multi-endpoint real HTTP/HTTPS concurrency burst (Cloudflare + Google gstatic + Google HTTPS)
+        endpoints = [
+            "http://cp.cloudflare.com/generate_204",
+            "http://www.gstatic.com/generate_204",
+            "https://www.google.com/generate_204",
+        ]
+        lat_samples: list[float] = []
+
+        def check_ep(ep: str) -> bool:
+            t0 = time.perf_counter()
+            try:
+                with opener.open(ep, timeout=timeout) as r:
+                    if 200 <= r.status < 400:
+                        lat_samples.append((time.perf_counter() - t0) * 1000.0)
+                        return True
+            except Exception:
+                pass
+            return False
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ep_pool:
+            outcomes = list(ep_pool.map(check_ep, endpoints))
+
+        res.multi_total = len(endpoints)
+        res.multi_ok = sum(1 for ok in outcomes if ok)
+
+        if res.multi_ok > 0:
+            res.http_ok = True
+            res.http_delay_ms = round(sum(lat_samples) / len(lat_samples), 1)
+            res.http_probe_msg = f"{res.multi_ok}/{res.multi_total} ({res.http_delay_ms:.0f}ms)"
+        else:
+            res.http_ok = False
+            res.http_delay_ms = 9999.0
+            res.http_probe_msg = "Stress Drop 0/3"
+            res.grade = compute_node_grade(res)
+            return res
+
+        # 2. Bandwidth speedtest using already-booted proxy instance
+        byte_limit = 524288
+        for sp_url in (
+            f"https://speed.cloudflare.com/__down?bytes={byte_limit}",
+            f"http://speed.cloudflare.com/__down?bytes={byte_limit}",
+            "http://proof.ovh.net/files/1Mb.dat",
+        ):
+            try:
+                t0 = time.perf_counter()
+                total_b = 0
+                with opener.open(sp_url, timeout=6.0) as resp:
+                    while True:
+                        chunk = resp.read(32768)
+                        if not chunk:
+                            break
+                        total_b += len(chunk)
+                        if total_b >= byte_limit or time.perf_counter() - t0 > 6.0:
+                            break
+                dt = max(0.01, time.perf_counter() - t0)
+                if total_b > 0:
+                    res.speed_mbps = round((total_b * 8.0) / (dt * 1_000_000.0), 2)
+                    break
+            except Exception:
+                continue
+
+        # 3. Exit IP, ISP, and RKP WL-ASN lookup using the same active tunnel
+        try:
+            with opener.open("http://ip-api.com/json/?fields=status,query,countryCode,isp,as", timeout=3.5) as r:
+                d = json.loads(r.read().decode("utf-8", errors="ignore"))
+                if d.get("status") == "success":
+                    cc = (d.get("countryCode") or "").lower()
+                    res.exit_ip = str(d.get("query", ""))
+                    res.exit_country = f"{_code_to_flag(cc)} {COUNTRY_RU_NAMES.get(cc, cc.upper())}"
+                    if not res.isp:
+                        res.isp = str(d.get("isp", ""))
+                    if not res.asn:
+                        res.asn = str(d.get("as", ""))
+                    wl_hit, _ = is_whitelist_asn(res.asn or res.isp)
+                    res.wl_asn = res.wl_asn or wl_hit
+        except Exception:
+            pass
+
+        res.grade = compute_node_grade(res)
+        return res
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if cfg_path and os.path.exists(cfg_path):
+            try:
+                os.unlink(cfg_path)
+            except Exception:
+                pass
+
+
+async def run_hardcore_stress_batch(
+    results: list[NodeCheckResult],
+    top_n: int = 15,
+    concurrency: int = 5,
+    progress_cb: Callable[[int, int, NodeCheckResult], None] | None = None,
+) -> list[NodeCheckResult]:
+    """Run concurrent hardcore multi-target + speed + exit-IP stress tests on top alive candidates."""
+    candidates = [r for r in results if r.alive and not (r.http_probe_msg and not r.http_ok)][:top_n]
+    if not candidates:
+        candidates = [r for r in results if r.alive][:top_n]
+    if not candidates:
+        return results
+
+    total = len(candidates)
+    done = 0
+    sem = asyncio.Semaphore(concurrency)
+    loop = asyncio.get_running_loop()
+
+    async def worker(r: NodeCheckResult) -> None:
+        nonlocal done
+        async with sem:
+            await loop.run_in_executor(None, _hardcore_stress_one_sync, r, 5.0)
+            done += 1
+            if progress_cb:
+                progress_cb(done, total, r)
+
+    await asyncio.gather(*(worker(r) for r in candidates))
+
+    for r in results:
+        if not r.grade:
+            r.grade = compute_node_grade(r)
+
+    results.sort(
+        key=lambda r: (
+            not r.alive,
+            not r.http_ok,
+            -r.multi_ok,
+            -r.speed_mbps,
+            r.http_delay_ms if r.http_ok else 9999.0,
+            r.latency_ms,
+        )
+    )
+    return results
